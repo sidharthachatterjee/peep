@@ -1,0 +1,11 @@
+[package]
+name = "peep"
+version = "0.1.0"
+edition = "2024"
+description = "A native macOS client for Google Chat"
+repository = "https://github.com/sidharthachatterjee/peep"
+publish = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Runtime compilation keeps development builds compatible with Command Line Tools alone.
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
