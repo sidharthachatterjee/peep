@@ -13,7 +13,10 @@ use prost::Message;
 use reqwest::{Url, header};
 use tokio::{runtime::Runtime, sync::Mutex};
 
-use super::{Conversation, Directory, Snapshot, Token, User, UserId, conversation, wire};
+use super::{
+    Conversation, ConversationId, Directory, Page, Snapshot, Token, User, UserId, conversation,
+    page, wire,
+};
 use crate::session::{self, Session};
 
 const ORIGIN: &str = "https://chat.google.com";
@@ -25,6 +28,13 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Conversations asked for per request: more than most accounts have, so one request
 /// usually brings them all. One large reply arrives much sooner than several small ones.
 const PAGE_SIZE: i32 = 2000;
+/// Messages asked for at a time: a few screens' worth.
+const MESSAGES_PER_PAGE: i32 = 40;
+/// Replies asked for per thread. A direct message rarely has threads.
+const REPLIES_PER_TOPIC: i32 = 20;
+/// Asks for what the web client asks for: each topic's read state, and read receipts.
+const TOPIC_METADATA: i32 = 4;
+const READ_RECEIPTS: i32 = 3;
 /// A guard against a server that never stops paging.
 const MAX_PAGES: usize = 50;
 /// How long a request token is used before a fresh one is fetched, in seconds. Google
@@ -99,9 +109,85 @@ impl Client {
     /// Loads the direct messages and the people in them afresh, with what to keep for the
     /// next launch.
     pub fn refresh(&self) -> impl Future<Output = Result<Snapshot, Error>> + 'static {
-        let inner = self.0.clone();
-        let task = inner.runtime.spawn(async move { inner.refresh().await });
+        self.spawn(move |inner| async move { inner.refresh().await })
+    }
+
+    /// A page of a conversation's messages: the newest, or those before `before`, which is
+    /// the `older` of the page after it.
+    pub fn messages(
+        &self,
+        conversation: &ConversationId,
+        before: Option<i64>,
+    ) -> impl Future<Output = Result<Page, Error>> + 'static {
+        let request = wire::ListTopicsRequest {
+            page_size_for_topics: MESSAGES_PER_PAGE,
+            filter: before.map(|before| wire::ListTopicsFilter {
+                older_than: Some(before),
+            }),
+            fetch_options: match before {
+                None => vec![TOPIC_METADATA, READ_RECEIPTS],
+                Some(_) => vec![TOPIC_METADATA],
+            },
+            page_size_for_unread_replies: REPLIES_PER_TOPIC,
+            page_size_for_read_replies: REPLIES_PER_TOPIC,
+            group_id: Some(group_id(conversation)),
+            sort_option: 2,
+            request_header: wire::request_header(),
+        };
+        self.spawn(move |inner| async move {
+            let response: wire::ListTopicsResponse = inner.call("list_topics", &request).await?;
+            Ok(page(response, before))
+        })
+    }
+
+    /// Tells Google the person has read `conversation` up to `time`, the time of its newest
+    /// message.
+    pub fn mark_read(
+        &self,
+        conversation: &ConversationId,
+        time: i64,
+    ) -> impl Future<Output = Result<(), Error>> + 'static {
+        let request = wire::MarkGroupReadstateRequest {
+            id: Some(group_id(conversation)),
+            last_read_time: time,
+            request_header: wire::request_header(),
+        };
+        self.spawn(move |inner| async move {
+            inner
+                .call::<_, wire::MarkGroupReadstateResponse>("mark_group_readstate", &request)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    /// Runs `work` on the network threads.
+    fn spawn<T, Work>(
+        &self,
+        work: impl FnOnce(Arc<Inner>) -> Work,
+    ) -> impl Future<Output = Result<T, Error>> + 'static
+    where
+        T: Send + 'static,
+        Work: Future<Output = Result<T, Error>> + Send + 'static,
+    {
+        let task = self.0.runtime.spawn(work(self.0.clone()));
         async move { task.await.unwrap_or(Err(Error::Interrupted)) }
+    }
+}
+
+fn group_id(conversation: &ConversationId) -> wire::GroupId {
+    match conversation {
+        ConversationId::Dm(id) => wire::GroupId {
+            dm_id: Some(wire::DmId {
+                dm_id: id.to_string(),
+            }),
+            space_id: None,
+        },
+        ConversationId::Space(id) => wire::GroupId {
+            space_id: Some(wire::SpaceId {
+                space_id: id.to_string(),
+            }),
+            dm_id: None,
+        },
     }
 }
 
@@ -142,6 +228,7 @@ impl Inner {
         });
 
         let mut directory = Directory {
+            me: Some(me),
             users: users.clone(),
             conversations,
         };

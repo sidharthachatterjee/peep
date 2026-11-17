@@ -245,6 +245,144 @@ pub struct Member {
     pub user: Option<User>,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct ListTopicsRequest {
+    #[prost(int32, tag = "2")]
+    pub page_size_for_topics: i32,
+    #[prost(message, optional, tag = "4")]
+    pub filter: Option<ListTopicsFilter>,
+    /// The web client sends these one by one, not packed.
+    #[prost(int32, repeated, packed = "false", tag = "5")]
+    pub fetch_options: Vec<i32>,
+    #[prost(int32, tag = "6")]
+    pub page_size_for_unread_replies: i32,
+    #[prost(int32, tag = "7")]
+    pub page_size_for_read_replies: i32,
+    #[prost(message, optional, tag = "8")]
+    pub group_id: Option<GroupId>,
+    /// The web client always sends 2. Its meaning is not known.
+    #[prost(int32, tag = "11")]
+    pub sort_option: i32,
+    #[prost(bytes = "vec", tag = "100")]
+    pub request_header: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListTopicsFilter {
+    /// Only topics sorted before this time.
+    #[prost(int64, optional, tag = "1")]
+    pub older_than: Option<i64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListTopicsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub topics: Vec<Topic>,
+    /// Nothing older exists.
+    #[prost(bool, tag = "4")]
+    pub contains_first_topic: bool,
+}
+
+/// A message at the top level of a conversation, with any replies in its thread.
+#[derive(Clone, PartialEq, Message)]
+pub struct Topic {
+    #[prost(int64, tag = "2")]
+    pub sort_time: i64,
+    #[prost(message, repeated, tag = "7")]
+    pub replies: Vec<ChatMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatMessage {
+    #[prost(message, optional, tag = "1")]
+    pub id: Option<MessageId>,
+    #[prost(message, optional, tag = "2")]
+    pub creator: Option<User>,
+    #[prost(int64, tag = "3")]
+    pub create_time: i64,
+    /// Above zero once the message is deleted.
+    #[prost(int64, tag = "8")]
+    pub delete_time: i64,
+    #[prost(string, tag = "10")]
+    pub text_body: String,
+    #[prost(message, repeated, tag = "11")]
+    pub annotations: Vec<Annotation>,
+    /// Above zero once the message is edited.
+    #[prost(int64, tag = "17")]
+    pub last_edit_time: i64,
+    /// 2 is a message from Google Chat itself, such as someone joining.
+    #[prost(int32, tag = "28")]
+    pub message_type: i32,
+    #[prost(message, optional, tag = "31")]
+    pub tombstone: Option<Tombstone>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageId {
+    #[prost(string, tag = "2")]
+    pub message_id: String,
+}
+
+/// Stands where a deleted message was.
+#[derive(Clone, PartialEq, Message)]
+pub struct Tombstone {
+    #[prost(bool, tag = "1")]
+    pub is_tombstone: bool,
+}
+
+/// Something attached to a message or marked within its text.
+#[derive(Clone, PartialEq, Message)]
+pub struct Annotation {
+    /// 11 is a video call.
+    #[prost(int32, tag = "1")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "4")]
+    pub drive: Option<DriveFile>,
+    #[prost(message, optional, tag = "7")]
+    pub link: Option<Link>,
+    #[prost(message, optional, tag = "10")]
+    pub upload: Option<Upload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DriveFile {
+    #[prost(string, tag = "2")]
+    pub title: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Link {
+    #[prost(string, tag = "1")]
+    pub title: String,
+    #[prost(message, optional, tag = "7")]
+    pub url: Option<SafeUrl>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SafeUrl {
+    #[prost(string, tag = "3")]
+    pub url: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Upload {
+    #[prost(string, tag = "3")]
+    pub content_name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MarkGroupReadstateRequest {
+    #[prost(message, optional, tag = "1")]
+    pub id: Option<GroupId>,
+    #[prost(int64, tag = "2")]
+    pub last_read_time: i64,
+    #[prost(bytes = "vec", tag = "100")]
+    pub request_header: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MarkGroupReadstateResponse {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +418,14 @@ mod tests {
         assert_eq!((fields[0], fields[47]), (5, 73));
         assert!(fields.contains(&17), "17 opens the history of some DMs");
         assert!(!fields.contains(&7) && !fields.contains(&71));
+    }
+
+    #[test]
+    fn fetch_options_are_sent_one_by_one() {
+        let request = ListTopicsRequest {
+            fetch_options: vec![4, 3],
+            ..Default::default()
+        };
+        assert_eq!(request.encode_to_vec(), [0x28, 4, 0x28, 3]);
     }
 }

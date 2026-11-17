@@ -1,4 +1,4 @@
-//! Google Chat: the people and direct messages of the signed-in account.
+//! Google Chat: the people, direct messages and messages of the signed-in account.
 
 mod client;
 mod wire;
@@ -29,9 +29,22 @@ pub enum ConversationId {
 impl ConversationId {
     /// A string that names this conversation among all of them.
     pub fn key(&self) -> String {
+        let (kind, id) = self.parts();
+        format!("{kind}/{id}")
+    }
+
+    /// Whether `key` is this conversation's [`key`](Self::key).
+    pub fn has_key(&self, key: &str) -> bool {
+        let (kind, id) = self.parts();
+        key.strip_prefix(kind)
+            .and_then(|rest| rest.strip_prefix('/'))
+            == Some(id)
+    }
+
+    fn parts(&self) -> (&'static str, &str) {
         match self {
-            ConversationId::Dm(id) => format!("dm/{id}"),
-            ConversationId::Space(id) => format!("space/{id}"),
+            ConversationId::Dm(id) => ("dm", id),
+            ConversationId::Space(id) => ("space", id),
         }
     }
 }
@@ -56,9 +69,47 @@ pub struct Conversation {
 /// Everything the conversation list shows.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Directory {
+    /// The signed-in person.
+    pub me: Option<UserId>,
     /// Direct messages, most recently active first.
     pub conversations: Vec<Conversation>,
     pub users: HashMap<UserId, User>,
+}
+
+/// One message in a conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Message {
+    pub id: Arc<str>,
+    pub sender: UserId,
+    /// The sender's name as the message carries it, which may be empty.
+    pub sender_name: Arc<str>,
+    /// When it was sent, in microseconds since the Unix epoch.
+    pub time: i64,
+    pub kind: MessageKind,
+    pub text: Arc<str>,
+    /// The names of attached files.
+    pub attachments: Vec<Arc<str>>,
+    pub edited: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageKind {
+    /// Written by a person or an app.
+    Sent,
+    /// From Google Chat itself, such as someone joining.
+    Notice,
+    /// Deleted, with a placeholder left where it was.
+    Deleted,
+}
+
+/// A run of a conversation's messages.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Page {
+    /// Oldest first.
+    pub messages: Vec<Message>,
+    /// What to pass as `before` for the page before this one. `None` at the conversation's
+    /// start.
+    pub older: Option<i64>,
 }
 
 /// What Peep keeps between launches so the list shows at once and the first request
@@ -173,6 +224,94 @@ fn conversation(item: wire::WorldItem, me: &UserId) -> Option<Conversation> {
         unread: u32::try_from(unread).unwrap_or(u32::MAX),
         muted,
         sort_time: item.sort_timestamp,
+    })
+}
+
+const NOTICE: i32 = 2;
+const VIDEO_CALL: i32 = 11;
+
+/// The messages of one reply to `list_topics`, asked for before `before`.
+fn page(response: wire::ListTopicsResponse, before: Option<i64>) -> Page {
+    let oldest = response
+        .topics
+        .iter()
+        .map(|topic| topic.sort_time)
+        .filter(|time| *time > 0)
+        .min();
+    let mut messages: Vec<Message> = response
+        .topics
+        .into_iter()
+        .flat_map(|topic| topic.replies)
+        .filter_map(message)
+        .collect();
+    messages.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.id.cmp(&b.id)));
+    messages.dedup_by(|a, b| a.id == b.id);
+
+    // A page that does not reach further back than what was asked for would repeat forever.
+    let older = oldest.filter(|oldest| {
+        !response.contains_first_topic && before.is_none_or(|before| *oldest < before)
+    });
+    Page { messages, older }
+}
+
+/// One message as shown, or `None` for one that leaves no trace: deleted without a
+/// placeholder, or a notice with nothing to say.
+fn message(message: wire::ChatMessage) -> Option<Message> {
+    let id = message
+        .id
+        .filter(|id| !id.message_id.is_empty())?
+        .message_id;
+    let deleted = message
+        .tombstone
+        .is_some_and(|tombstone| tombstone.is_tombstone);
+    let kind = if deleted {
+        MessageKind::Deleted
+    } else if message.delete_time > 0 {
+        return None;
+    } else if message.message_type == NOTICE {
+        MessageKind::Notice
+    } else {
+        MessageKind::Sent
+    };
+    if kind == MessageKind::Notice && message.text_body.trim().is_empty() {
+        return None;
+    }
+    let has_text = !message.text_body.is_empty();
+    let attachments = message
+        .annotations
+        .into_iter()
+        .filter_map(|annotation| {
+            if let Some(upload) = annotation.upload {
+                Some(upload.content_name)
+            } else if let Some(drive) = annotation.drive {
+                Some(drive.title)
+            } else if annotation.kind == VIDEO_CALL {
+                Some("Video call".to_owned())
+            } else if has_text {
+                // The text already shows its links.
+                None
+            } else {
+                let link = annotation.link?;
+                Some(if link.title.is_empty() {
+                    link.url.unwrap_or_default().url
+                } else {
+                    link.title
+                })
+            }
+        })
+        .filter(|name| !name.is_empty())
+        .map(Arc::from)
+        .collect();
+    let creator = message.creator.unwrap_or_default();
+    Some(Message {
+        id: id.into(),
+        sender: UserId(creator.user_id.unwrap_or_default().id.into()),
+        sender_name: creator.name.into(),
+        time: message.create_time,
+        kind,
+        text: message.text_body.into(),
+        attachments,
+        edited: message.last_edit_time > 0,
     })
 }
 
@@ -384,6 +523,15 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_knows_its_own_key() {
+        let dm = ConversationId::Dm("abc".into());
+        assert_eq!(dm.key(), "dm/abc");
+        assert!(dm.has_key("dm/abc"));
+        assert!(!dm.has_key("space/abc") && !dm.has_key("dm/abcd") && !dm.has_key("dmabc"));
+        assert!(ConversationId::Space("abc".into()).has_key("space/abc"));
+    }
+
+    #[test]
     fn a_snapshot_survives_being_stored() {
         let ada = UserId("ada".into());
         let mut snapshot = Snapshot {
@@ -416,5 +564,131 @@ mod tests {
             serde_json::from_slice::<Snapshot>(&stored).unwrap(),
             snapshot
         );
+    }
+
+    fn sent(id: &str, time: i64, text: &str) -> wire::ChatMessage {
+        wire::ChatMessage {
+            id: Some(wire::MessageId {
+                message_id: id.into(),
+            }),
+            creator: Some(wire::User {
+                user_id: Some(user_id("ada")),
+                name: "Ada".into(),
+                ..Default::default()
+            }),
+            create_time: time,
+            text_body: text.into(),
+            ..Default::default()
+        }
+    }
+
+    fn topic(sort_time: i64, replies: Vec<wire::ChatMessage>) -> wire::Topic {
+        wire::Topic { sort_time, replies }
+    }
+
+    #[test]
+    fn a_page_is_oldest_first_with_thread_replies_in_line() {
+        let response = wire::ListTopicsResponse {
+            topics: vec![
+                topic(30, vec![sent("c", 30, "third")]),
+                topic(10, vec![sent("a", 10, "first"), sent("d", 40, "a reply")]),
+                topic(20, vec![sent("b", 20, "second"), sent("b", 20, "second")]),
+            ],
+            contains_first_topic: false,
+        };
+
+        let page = page(response, None);
+
+        let texts: Vec<&str> = page.messages.iter().map(|message| &*message.text).collect();
+        assert_eq!(texts, ["first", "second", "third", "a reply"]);
+        assert_eq!(page.older, Some(10));
+        assert_eq!(
+            (&*page.messages[0].sender.0, &*page.messages[0].sender_name),
+            ("ada", "Ada")
+        );
+    }
+
+    #[test]
+    fn paging_back_stops_at_the_start_or_when_nothing_older_came() {
+        let reply = |first| wire::ListTopicsResponse {
+            topics: vec![topic(10, vec![sent("a", 10, "first")])],
+            contains_first_topic: first,
+        };
+
+        assert_eq!(page(reply(true), None).older, None);
+        assert_eq!(page(reply(false), Some(11)).older, Some(10));
+        assert_eq!(
+            page(reply(false), Some(10)).older,
+            None,
+            "no further back than what was asked for"
+        );
+        assert_eq!(page(wire::ListTopicsResponse::default(), None).older, None);
+    }
+
+    #[test]
+    fn deleted_edited_and_attached_messages_are_told_apart() {
+        let mut deleted = sent("a", 1, "");
+        deleted.delete_time = 5;
+        assert_eq!(message(deleted.clone()), None, "gone without a trace");
+        deleted.tombstone = Some(wire::Tombstone { is_tombstone: true });
+        assert_eq!(message(deleted).unwrap().kind, MessageKind::Deleted);
+
+        let mut notice = sent("b", 2, " ");
+        notice.message_type = NOTICE;
+        assert_eq!(
+            message(notice.clone()),
+            None,
+            "a notice with nothing to say"
+        );
+        notice.text_body = "Ada joined".into();
+        assert_eq!(message(notice).unwrap().kind, MessageKind::Notice);
+
+        let mut edited = sent("c", 3, "see attached");
+        edited.last_edit_time = 4;
+        let link = |title: &str| wire::Annotation {
+            link: Some(wire::Link {
+                title: title.into(),
+                url: Some(wire::SafeUrl {
+                    url: "https://example.com".into(),
+                }),
+            }),
+            ..Default::default()
+        };
+        edited.annotations = vec![
+            wire::Annotation {
+                upload: Some(wire::Upload {
+                    content_name: "plan.pdf".into(),
+                }),
+                ..Default::default()
+            },
+            wire::Annotation {
+                drive: Some(wire::DriveFile {
+                    title: "Budget".into(),
+                }),
+                ..Default::default()
+            },
+            wire::Annotation {
+                kind: VIDEO_CALL,
+                ..Default::default()
+            },
+            link("Shown by the text"),
+            wire::Annotation::default(),
+        ];
+        let edited = message(edited).unwrap();
+        assert!(edited.edited);
+        let names: Vec<&str> = edited.attachments.iter().map(|name| &**name).collect();
+        assert_eq!(names, ["plan.pdf", "Budget", "Video call"]);
+
+        let mut bare = sent("d", 5, "");
+        bare.annotations = vec![link("A page"), link("")];
+        let names = message(bare).unwrap().attachments;
+        let names: Vec<&str> = names.iter().map(|name| &**name).collect();
+        assert_eq!(
+            names,
+            ["A page", "https://example.com"],
+            "a link with no text"
+        );
+
+        assert_eq!(message(wire::ChatMessage::default()), None, "no id");
     }
 }

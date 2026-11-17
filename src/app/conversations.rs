@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use crate::{
-    account::{Account, Row},
+    account::Account,
     theme::ActiveTheme,
     ui::{Avatar, Badge, Color, Label, ListItem, Next, Previous, focus_visible},
 };
@@ -42,14 +42,10 @@ impl Conversations {
         }
     }
 
-    /// The selected conversation, if it is still in the list.
-    pub fn selected<'a>(&self, cx: &'a gpui::App) -> Option<&'a Row> {
-        let selected = self.selected.as_ref()?;
-        self.account
-            .read(cx)
-            .rows()
-            .iter()
-            .find(|row| row.id == *selected)
+    /// The id of the selected conversation. It is cleared when the conversation leaves the
+    /// list.
+    pub fn selected_id(&self) -> Option<SharedString> {
+        self.selected.clone()
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -155,7 +151,10 @@ mod tests {
     use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
 
     use super::*;
-    use crate::{account::Status, ui::Root};
+    use crate::{
+        account::{Row, Status},
+        ui::Root,
+    };
 
     fn row(id: &str) -> Row {
         Row {
@@ -188,9 +187,7 @@ mod tests {
     }
 
     fn selected(list: &Entity<Conversations>, cx: &mut VisualTestContext) -> Option<String> {
-        list.read_with(cx, |list, cx| {
-            list.selected(cx).map(|row| row.id.to_string())
-        })
+        list.read_with(cx, |list, _| list.selected_id().map(|id| id.to_string()))
     }
 
     #[gpui::test]

@@ -85,6 +85,8 @@ pub struct Sizes {
     pub window_buttons: Point<Pixels>,
     /// The conversation list beside the open conversation.
     pub sidebar: Pixels,
+    /// How far past its edges a long list lays rows out, so scrolling never shows a gap.
+    pub list_overdraw: Pixels,
     /// The Chrome window Google's sign-in page opens in.
     pub sign_in_window: Size<Pixels>,
     /// A window when it first opens.
@@ -183,6 +185,7 @@ impl Sizes {
             titlebar: px(38.),
             window_buttons: point(px(13.), px(12.)),
             sidebar: px(280.),
+            list_overdraw: px(600.),
             sign_in_window: size(px(480.), px(700.)),
             window: size(px(1040.), px(720.)),
             window_min: size(px(720.), px(480.)),

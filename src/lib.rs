@@ -6,4 +6,5 @@ pub mod cache;
 pub mod chat;
 pub mod session;
 pub mod theme;
+pub mod time;
 pub mod ui;

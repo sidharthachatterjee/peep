@@ -13,8 +13,8 @@ use peep::{
     theme::{self, ActiveTheme, Mode, Theme},
     ui::{
         self, Avatar, Badge, Button, ButtonVariant, Checkbox, Color, ControlSize, Divider,
-        Elevation, Label, List, ListItem, Preview, Root, SegmentedControl, Surface, Switch,
-        TextSize,
+        Elevation, Label, List, ListItem, MessageRow, Preview, Root, SegmentedControl, Surface,
+        Switch, TextSize,
     },
 };
 
@@ -110,6 +110,7 @@ impl Render for Gallery {
             .child(self.toggles(&theme, cx))
             .child(segmented_controls(&theme))
             .child(self.lists(&theme, cx))
+            .child(messages(&theme))
             .child(avatars_and_badges(&theme));
 
         div()
@@ -576,6 +577,34 @@ fn avatars_and_badges(theme: &Theme) -> Div {
     section("Avatar and badge", theme)
         .child(group("Avatar", theme).child(row(theme).items_end().children(avatars)))
         .child(group("Badge", theme).child(row(theme).gap(theme.spacing.sm).children(badges)))
+}
+
+fn messages(theme: &Theme) -> Div {
+    let conversation = Surface::new(Elevation::Flat)
+        .child(
+            MessageRow::new("Ada Lovelace", "09:12")
+                .day("Yesterday")
+                .text("The engine is ready for its first run."),
+        )
+        .child(
+            MessageRow::new("Ada Lovelace", "09:12")
+                .continues(true)
+                .text("I have punched the cards for the Bernoulli numbers. If they come out right we should write the method up, with a table of every step so anyone can follow it.")
+                .edited(true),
+        )
+        .child(MessageRow::notice("Grace Hopper joined"))
+        .child(
+            MessageRow::new("You", "09:20")
+                .day("Today")
+                .text("Sending the notes now.")
+                .attachment("Notes on the engine.pdf"),
+        )
+        .child(MessageRow::new("You", "09:21").continues(true).deleted())
+        .child(MessageRow::new("Grace Hopper", "09:30").attachment("Video call"))
+        .child(MessageRow::new("Grace Hopper", "09:31").continues(true))
+        .child(div().h(theme.spacing.md));
+
+    section("Messages", theme).child(div().max_w(theme.size.window_min.width).child(conversation))
 }
 
 /// One control drawn in each state. `build` receives an index for the control's id,

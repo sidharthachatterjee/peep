@@ -1,13 +1,14 @@
 //! The application: its menu, its key bindings and its main window.
 
 mod conversations;
+mod messages;
 
 use gpui::{
     App, Application, Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, Render,
     Window, actions, div, prelude::*,
 };
 
-use self::conversations::Conversations;
+use self::{conversations::Conversations, messages::Messages};
 use crate::{
     account::{Account, Status},
     theme::ActiveTheme,
@@ -100,13 +101,20 @@ fn with_active_window(cx: &mut App, action: impl FnOnce(&mut Window) + 'static) 
 struct Main {
     account: Entity<Account>,
     conversations: Entity<Conversations>,
+    messages: Entity<Messages>,
 }
 
 impl Main {
     fn new(account: Entity<Account>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let conversations = cx.new(|cx| Conversations::new(account.clone(), cx));
+        let messages = cx.new(|cx| Messages::new(account.clone(), window, cx));
         cx.observe(&account, |_, _, cx| cx.notify()).detach();
-        cx.observe(&conversations, |_, _, cx| cx.notify()).detach();
+        cx.observe_in(&conversations, window, |this, conversations, window, cx| {
+            let selected = conversations.read(cx).selected_id();
+            this.messages
+                .update(cx, |messages, cx| messages.show(selected, window, cx));
+        })
+        .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.account
@@ -117,6 +125,7 @@ impl Main {
         Self {
             account,
             conversations,
+            messages,
         }
     }
 }
@@ -160,20 +169,18 @@ impl Render for Main {
                         this.account.update(cx, |account, cx| account.retry(cx));
                     })),
                 )),
-            Status::Ready => {
-                let open = match self.conversations.read(cx).selected(cx) {
-                    Some(row) => centered()
-                        .child(Label::new(row.title.clone()).size(TextSize::Title))
-                        .child(note("Messages are not shown yet.")),
-                    None => centered().child(note("Select a conversation.")),
-                };
-                div()
-                    .size_full()
-                    .flex()
-                    .child(self.conversations.clone())
-                    .child(Divider::vertical())
-                    .child(open.flex_1())
-            }
+            Status::Ready => div()
+                .size_full()
+                .flex()
+                .child(self.conversations.clone())
+                .child(Divider::vertical())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.messages.clone()),
+                ),
         }
     }
 }
