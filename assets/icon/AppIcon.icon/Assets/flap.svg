@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <g transform="translate(0 0) rotate(-6 512 512) translate(512 512) scale(1.0) translate(-512 -512)">
+    <defs><clipPath id="f"><path d="M 840 370 C 770 470 684 600 646 762 L 646 900 L 900 900 L 900 370 Z"/></clipPath></defs>
+    <path d="M 226 452 C 226 284 354 150 512 150 C 670 150 798 284 798 452 C 798 582 816 692 844 792 Q 777.6 876 711.2 792 T 578.4 792 T 445.6 792 T 312.8 792 T 180.0 792 C 208 692 226 582 226 452 Z" fill="#ffffff" clip-path="url(#f)"/>
+  </g>
+</svg>

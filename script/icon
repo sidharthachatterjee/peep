@@ -1,0 +1,49 @@
+#!/bin/sh
+# Renders assets/icon/AppIcon.icon as macOS will show it, in every appearance, into
+# target/icon/, with preview.png comparing them. Uses the renderer of Xcode's Icon Composer.
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+icon="$root/assets/icon/AppIcon.icon"
+out="$root/target/icon"
+xcode="${XCODE:-/Applications/Xcode.app}"
+ictool="$xcode/Contents/Applications/Icon Composer.app/Contents/Executables/ictool"
+chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+if [ ! -x "$ictool" ]; then
+    echo "Icon Composer was not found in $xcode. Install Xcode, or set XCODE to where it is." >&2
+    exit 1
+fi
+
+mkdir -p "$out"
+for rendition in Default Dark ClearLight ClearDark TintedLight TintedDark; do
+    "$ictool" "$icon" --export-image --output-file "$out/$rendition.png" \
+        --platform macOS --rendition "$rendition" --width 1024 --height 1024 --scale 1 >/dev/null
+done
+
+light="#e9ebee"
+dark="#1b1c20"
+warm="linear-gradient(135deg,#f7b267,#f25c54 55%,#7a5cff)"
+cool="linear-gradient(135deg,#243b55,#141e30)"
+tile() {
+    printf '<div style="background:%s"><img src="%s.png" width="300"></div>\n' "$2" "$1"
+}
+{
+    echo '<body style="margin:0;display:grid;grid-template-columns:repeat(3,400px);grid-auto-rows:380px;place-items:stretch">'
+    echo '<style>div{display:flex;align-items:center;justify-content:center;gap:16px}</style>'
+    printf '<div style="background:%s"><img src="Default.png" width="300"><span style="display:grid;gap:12px;justify-items:center"><img src="Default.png" width="64"><img src="Default.png" width="32"><img src="Default.png" width="16"></span></div>\n' "$light"
+    tile Dark "$dark"
+    tile ClearLight "$warm"
+    tile ClearDark "$cool"
+    tile TintedLight "$light"
+    tile TintedDark "$dark"
+    echo '</body>'
+} > "$out/preview.html"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+"$chrome" --headless=new --hide-scrollbars --no-first-run --user-data-dir="$work" \
+    --window-size=1200,760 --allow-file-access-from-files \
+    --screenshot="$out/preview.png" "file://$out/preview.html" >/dev/null 2>&1
+rm "$out/preview.html"
+echo "$out/preview.png"
