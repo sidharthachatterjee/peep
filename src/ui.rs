@@ -26,7 +26,7 @@ pub use label::Label;
 pub use list::{List, ListItem};
 pub use root::{Root, window_options};
 pub use segmented_control::SegmentedControl;
-pub use style::{Color, ControlSize, Preview, TextSize};
+pub use style::{Color, ControlSize, Preview, TextSize, focus_visible};
 pub use surface::{Divider, Elevation, Surface};
 pub use toggle::{Checkbox, Switch};
 

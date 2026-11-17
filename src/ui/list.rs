@@ -119,6 +119,7 @@ impl RenderOnce for List {
 pub struct ListItem {
     id: ElementId,
     selected: bool,
+    focused: bool,
     disabled: bool,
     preview: Option<Preview>,
     on_click: Option<ClickHandler>,
@@ -130,6 +131,7 @@ impl ListItem {
         Self {
             id: id.into(),
             selected: false,
+            focused: false,
             disabled: false,
             preview: None,
             on_click: None,
@@ -139,6 +141,12 @@ impl ListItem {
 
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    /// Draws the keyboard focus ring around the row, for lists that draw their own rows.
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
         self
     }
 
@@ -197,6 +205,9 @@ impl RenderOnce for ListItem {
                     .when_some(self.on_click, |this, on_click| {
                         this.on_click(move |event, window, cx| on_click(event, window, cx))
                     })
+            })
+            .when(self.focused, |this| {
+                this.child(focus_ring(theme.radius.md, theme))
             })
             .children(self.children)
     }

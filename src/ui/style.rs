@@ -142,12 +142,12 @@ pub(super) fn focus_ring(radius: Pixels, theme: &Theme) -> Div {
         .border_color(theme.colors.focus_ring)
 }
 
-/// Whether focus last moved by keyboard. Controls show their focus ring only then.
 struct KeyboardFocus(bool);
 
 impl Global for KeyboardFocus {}
 
-pub(super) fn focus_visible(cx: &App) -> bool {
+/// Whether focus last moved by keyboard. Controls show their focus ring only then.
+pub fn focus_visible(cx: &App) -> bool {
     cx.try_global::<KeyboardFocus>()
         .is_some_and(|keyboard| keyboard.0)
 }

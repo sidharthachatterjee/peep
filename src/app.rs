@@ -1,14 +1,23 @@
 //! The application: its menu, its key bindings and its main window.
 
+mod conversations;
+
 use gpui::{
-    App, Application, Context, IntoElement, KeyBinding, Menu, MenuItem, Render, Window, actions,
-    div, prelude::*,
+    App, Application, Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, Render,
+    Window, actions, div, prelude::*,
 };
 
+use self::conversations::Conversations;
 use crate::{
+    account::{Account, Status},
     theme::ActiveTheme,
-    ui::{self, Color, Label, Root, TextSize},
+    ui::{self, Button, ButtonVariant, Color, Divider, Label, Root, TextSize},
 };
+
+/// The account lives as long as the app, so it outlasts the window.
+struct SignedIn(Entity<Account>);
+
+impl Global for SignedIn {}
 
 actions!(peep, [Quit, Hide, Minimize, CloseWindow]);
 
@@ -23,6 +32,9 @@ pub fn run() {
     });
     app.run(|cx| {
         init(cx);
+        let account = cx.new(Account::new);
+        cx.set_global(SignedIn(account));
+        open_window(cx);
         cx.activate(true);
     });
 }
@@ -57,13 +69,12 @@ fn init(cx: &mut App) {
             ],
         },
     ]);
-
-    open_window(cx);
 }
 
 fn open_window(cx: &mut App) {
+    let account = cx.global::<SignedIn>().0.clone();
     let opened = cx.open_window(ui::window_options("Peep", cx), |window, cx| {
-        let main = cx.new(|_| Main);
+        let main = cx.new(|cx| Main::new(account, window, cx));
         cx.new(|cx| Root::new(main, window, cx))
     });
     if let Err(error) = opened {
@@ -86,19 +97,84 @@ fn with_active_window(cx: &mut App, action: impl FnOnce(&mut Window) + 'static) 
 }
 
 /// The content of the main window.
-struct Main;
+struct Main {
+    account: Entity<Account>,
+    conversations: Entity<Conversations>,
+}
+
+impl Main {
+    fn new(account: Entity<Account>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let conversations = cx.new(|cx| Conversations::new(account.clone(), cx));
+        cx.observe(&account, |_, _, cx| cx.notify()).detach();
+        cx.observe(&conversations, |_, _, cx| cx.notify()).detach();
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.account
+                    .update(cx, |account, cx| account.refresh_if_stale(cx));
+            }
+        })
+        .detach();
+        Self {
+            account,
+            conversations,
+        }
+    }
+}
 
 impl Render for Main {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(cx.theme().spacing.xs)
-            .child(Label::new("Peep").size(TextSize::Title))
-            .child(Label::new("Nothing to show yet.").color(Color::Muted))
+        let theme = cx.theme();
+        let centered = || {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(theme.spacing.sm)
+        };
+        let note = |text: &'static str| Label::new(text).color(Color::Muted);
+
+        match self.account.read(cx).status() {
+            Status::Starting => centered(),
+            Status::Loading => centered().child(note("Loading your messages…")),
+            Status::SigningIn => {
+                centered().child(note("Finish signing in in the Chrome window that opened."))
+            }
+            Status::SignedOut => centered()
+                .child(Label::new("Peep").size(TextSize::Title))
+                .child(note("Sign in to see your Google Chat direct messages."))
+                .child(
+                    div().pt(theme.spacing.sm).child(
+                        Button::new("sign-in", "Sign in with Google")
+                            .variant(ButtonVariant::Primary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.account.update(cx, |account, cx| account.sign_in(cx));
+                            })),
+                    ),
+                ),
+            Status::Failed(message) => centered()
+                .child(Label::new(message.clone()).color(Color::Danger))
+                .child(div().pt(theme.spacing.sm).child(
+                    Button::new("retry", "Try again").on_click(cx.listener(|this, _, _, cx| {
+                        this.account.update(cx, |account, cx| account.retry(cx));
+                    })),
+                )),
+            Status::Ready => {
+                let open = match self.conversations.read(cx).selected(cx) {
+                    Some(row) => centered()
+                        .child(Label::new(row.title.clone()).size(TextSize::Title))
+                        .child(note("Messages are not shown yet.")),
+                    None => centered().child(note("Select a conversation.")),
+                };
+                div()
+                    .size_full()
+                    .flex()
+                    .child(self.conversations.clone())
+                    .child(Divider::vertical())
+                    .child(open.flex_1())
+            }
+        }
     }
 }
 
@@ -110,7 +186,12 @@ mod tests {
 
     #[gpui::test]
     fn it_opens_one_window_and_cmd_w_closes_it(cx: &mut TestAppContext) {
-        cx.update(init);
+        cx.update(|cx| {
+            init(cx);
+            let account = cx.new(|_| Account::with(Status::SignedOut, Vec::new()));
+            cx.set_global(SignedIn(account));
+            open_window(cx);
+        });
         let windows = cx.update(|cx| cx.windows());
         assert_eq!(windows.len(), 1);
 

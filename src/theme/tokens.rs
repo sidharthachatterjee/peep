@@ -83,6 +83,10 @@ pub struct Sizes {
     pub titlebar: Pixels,
     /// Where the window buttons sit inside that strip.
     pub window_buttons: Point<Pixels>,
+    /// The conversation list beside the open conversation.
+    pub sidebar: Pixels,
+    /// The Chrome window Google's sign-in page opens in.
+    pub sign_in_window: Size<Pixels>,
     /// A window when it first opens.
     pub window: Size<Pixels>,
     /// The smallest a window can be made.
@@ -178,6 +182,8 @@ impl Sizes {
             badge: px(18.),
             titlebar: px(38.),
             window_buttons: point(px(13.), px(12.)),
+            sidebar: px(280.),
+            sign_in_window: size(px(480.), px(700.)),
             window: size(px(1040.), px(720.)),
             window_min: size(px(720.), px(480.)),
         }
