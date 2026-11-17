@@ -94,6 +94,14 @@ impl Messages {
             Change::Prepended(added) if shown > 0 && shown + added == count => {
                 self.list.splice(0..1, added + 1)
             }
+            Change::Updated(index) if shown == count && index < count => {
+                self.list.splice(index..index + 1, 1)
+            }
+            // The row after it is laid out again, for the same reason.
+            Change::Removed(index) if shown == count + 1 && index < shown => {
+                let after = usize::from(index < count);
+                self.list.splice(index..index + 1 + after, after)
+            }
             _ => self.list.reset(count),
         }
         cx.notify();
@@ -356,6 +364,68 @@ mod tests {
         assert!(
             at_newest(&messages, cx),
             "older messages do not move the view"
+        );
+    }
+
+    #[gpui::test]
+    fn what_the_live_channel_reports_shows_at_once(cx: &mut TestAppContext) {
+        use crate::chat::{ConversationId, Event};
+
+        let (account, messages, cx) = open(cx, vec![row("dm/a", None), row("dm/b", None)]);
+        account.update(cx, |account, _| account.know(&["a", "b"]));
+        show(&messages, "dm/a", cx);
+        arrive(&account, "dm/a", page(0, 30, None), cx);
+        let hear = |event: Event, cx: &mut VisualTestContext| {
+            account.update(cx, |account, cx| account.heard(event, cx));
+            cx.run_until_parked();
+        };
+        let message = |conversation: &str, number: usize, posted: bool| Event::Message {
+            conversation: ConversationId::Dm(conversation.into()),
+            message: page(number, 1, None).messages.remove(0),
+            posted,
+        };
+
+        hear(message("a", 30, true), cx);
+        assert_eq!(count(&messages, cx), 31);
+        assert!(at_newest(&messages, cx));
+
+        let mut changed = page(10, 1, None).messages.remove(0);
+        changed.text = "Changed".into();
+        hear(
+            Event::Message {
+                conversation: ConversationId::Dm("a".into()),
+                message: changed,
+                posted: false,
+            },
+            cx,
+        );
+        hear(
+            Event::Removed {
+                conversation: ConversationId::Dm("a".into()),
+                message: "m5".into(),
+            },
+            cx,
+        );
+        assert_eq!(count(&messages, cx), 30);
+        let texts = account.read_with(cx, |account, _| {
+            let entries = account.timeline(&"dm/a".into()).unwrap().entries();
+            (entries[5].id.to_string(), entries[9].text.to_string())
+        });
+        assert_eq!(texts, ("m6".to_owned(), "Changed".to_owned()));
+
+        hear(message("b", 40, true), cx);
+        assert_eq!(count(&messages, cx), 30, "another conversation's message");
+        let rows = account.read_with(cx, |account, _| {
+            account
+                .rows()
+                .iter()
+                .map(|row| (row.id.to_string(), row.unread.is_some()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            rows,
+            [("dm/b".to_owned(), true), ("dm/a".to_owned(), false)],
+            "it moves its conversation to the top, unread; the open one stays read"
         );
     }
 

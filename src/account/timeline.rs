@@ -11,7 +11,8 @@ use crate::{
 
 /// Messages from one person this close together are drawn as one run.
 const RUN_WINDOW: i64 = 5 * 60 * 1_000_000;
-/// How long the newest messages count as current before they are asked for again.
+/// Without the live channel, how long the newest messages count as current before they are
+/// asked for again.
 const FRESH_FOR: Duration = Duration::from_secs(5);
 
 /// One message, ready to draw.
@@ -39,6 +40,10 @@ pub enum Change {
     Appended(usize),
     /// Entries were added at the start. The entry that was first may now draw differently.
     Prepended(usize),
+    /// The entry at this index changed.
+    Updated(usize),
+    /// The entry at this index went away. The one after it may now draw differently.
+    Removed(usize),
     /// Anything else.
     Replaced,
 }
@@ -52,6 +57,8 @@ pub struct Timeline {
     older: Option<i64>,
     /// When the newest messages last arrived.
     loaded: Option<Instant>,
+    /// Messages may have been missed since then.
+    pub(super) outdated: bool,
     pub(super) loading: bool,
     pub(super) loading_older: bool,
     /// Why the newest messages could not be loaded.
@@ -85,12 +92,13 @@ impl Timeline {
         self.older.filter(|_| !self.loading_older)
     }
 
-    /// Whether the newest messages should be asked for.
-    pub(super) fn is_stale(&self) -> bool {
-        !self.loading
-            && self
-                .loaded
-                .is_none_or(|loaded| loaded.elapsed() > FRESH_FOR)
+    /// Whether the newest messages should be asked for. While the live channel is up
+    /// (`live`), messages arrive by themselves and only a known gap calls for asking.
+    pub(super) fn is_stale(&self, live: bool) -> bool {
+        let current = self
+            .loaded
+            .is_some_and(|loaded| live || loaded.elapsed() <= FRESH_FOR);
+        !self.loading && (self.outdated || !current)
     }
 
     /// When the newest message was sent.
@@ -107,6 +115,7 @@ impl Timeline {
     ) -> Option<Change> {
         self.loading = false;
         self.failed = None;
+        self.outdated = false;
         self.loaded = Some(Instant::now());
 
         let first = page.messages.first().map(|message| message.time);
@@ -127,7 +136,20 @@ impl Timeline {
         if !meets || messages.is_empty() {
             self.older = page.older;
         }
+        // Messages the live channel delivered while the page was on its way stay.
+        let last = page.messages.last().map(|message| message.time);
+        let newer: Vec<Message> = self
+            .messages
+            .iter()
+            .filter(|known| {
+                meets
+                    && last.is_some_and(|last| known.time > last)
+                    && !page.messages.iter().any(|message| message.id == known.id)
+            })
+            .cloned()
+            .collect();
         messages.extend(page.messages);
+        messages.extend(newer);
 
         if messages == self.messages {
             return None;
@@ -170,6 +192,62 @@ impl Timeline {
         self.messages = older;
         self.rebuild(name);
         Some(Change::Prepended(added))
+    }
+
+    /// Takes in a message the live channel reported: a new one (`posted`), or a change to
+    /// one already posted. Until the newest messages have loaded there is nothing to add
+    /// it to, and loading brings it.
+    pub(super) fn apply(
+        &mut self,
+        message: Message,
+        posted: bool,
+        name: impl Fn(&Message) -> SharedString,
+    ) -> Option<Change> {
+        if !self.is_loaded() {
+            return None;
+        }
+        let change = match self
+            .messages
+            .iter()
+            .position(|known| known.id == message.id)
+        {
+            Some(index) if self.messages[index] == message => return None,
+            Some(index) => {
+                self.messages[index] = message;
+                Change::Updated(index)
+            }
+            // A change to a message further back than what is loaded.
+            None if !posted => return None,
+            None => {
+                let index = self
+                    .messages
+                    .partition_point(|known| known.time <= message.time);
+                if index == 0 && self.older.is_some() {
+                    return None;
+                }
+                let appended = index == self.messages.len();
+                self.messages.insert(index, message);
+                if appended {
+                    Change::Appended(1)
+                } else {
+                    Change::Replaced
+                }
+            }
+        };
+        self.rebuild(name);
+        Some(change)
+    }
+
+    /// Drops a message that was deleted.
+    pub(super) fn remove(
+        &mut self,
+        id: &str,
+        name: impl Fn(&Message) -> SharedString,
+    ) -> Option<Change> {
+        let index = self.messages.iter().position(|known| &*known.id == id)?;
+        self.messages.remove(index);
+        self.rebuild(name);
+        Some(Change::Removed(index))
     }
 
     fn rebuild(&mut self, name: impl Fn(&Message) -> SharedString) {
@@ -342,5 +420,84 @@ mod tests {
         assert_eq!(ids(&timeline), ["a", "b", "c"]);
         assert!(!timeline.entries()[2].leads, "it now continues a run");
         assert_eq!(timeline.older(), None, "the start was reached");
+    }
+
+    #[test]
+    fn live_messages_join_and_change_what_is_loaded() {
+        let mut timeline = Timeline::default();
+        assert_eq!(
+            timeline.apply(message("x", "ada", NOON), true, name),
+            None,
+            "nothing is loaded to add it to"
+        );
+        timeline.merge_newest(
+            page(
+                vec![
+                    message("b", "ada", NOON + MINUTE),
+                    message("c", "ada", NOON + 2 * MINUTE),
+                ],
+                Some(NOON),
+            ),
+            name,
+        );
+
+        let new = message("d", "grace", NOON + 3 * MINUTE);
+        assert_eq!(
+            timeline.apply(new.clone(), true, name),
+            Some(Change::Appended(1))
+        );
+        assert_eq!(timeline.apply(new, true, name), None, "heard twice");
+
+        let mut preview = message("c", "ada", NOON + 2 * MINUTE);
+        preview.attachments = vec!["A page".into()];
+        assert_eq!(
+            timeline.apply(preview, false, name),
+            Some(Change::Updated(1))
+        );
+        assert_eq!(timeline.entries()[1].attachments.len(), 1);
+
+        assert_eq!(
+            timeline.apply(message("old", "ada", NOON - MINUTE), false, name),
+            None,
+            "a change to a message that is not loaded"
+        );
+        assert_eq!(
+            timeline.apply(message("a", "ada", NOON), true, name),
+            None,
+            "older than what is loaded, with more to load"
+        );
+
+        assert_eq!(timeline.remove("c", name), Some(Change::Removed(1)));
+        assert_eq!(timeline.remove("c", name), None);
+        assert_eq!(ids(&timeline), ["b", "d"]);
+    }
+
+    #[test]
+    fn a_page_keeps_what_the_live_channel_delivered_after_it() {
+        let mut timeline = Timeline::default();
+        let first = vec![message("a", "ada", NOON)];
+        timeline.merge_newest(page(first.clone(), None), name);
+        timeline.apply(message("b", "ada", NOON + MINUTE), true, name);
+
+        assert_eq!(
+            timeline.merge_newest(page(first, None), name),
+            None,
+            "the page was made before the newest message"
+        );
+        assert_eq!(ids(&timeline), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_live_channel_decides_when_messages_go_stale() {
+        let mut timeline = Timeline::default();
+        assert!(timeline.is_stale(true), "never loaded");
+
+        timeline.merge_newest(page(vec![message("a", "ada", NOON)], None), name);
+        assert!(!timeline.is_stale(true) && !timeline.is_stale(false));
+
+        timeline.outdated = true;
+        assert!(timeline.is_stale(true), "the channel missed something");
+        timeline.loading = true;
+        assert!(!timeline.is_stale(true), "already on their way");
     }
 }

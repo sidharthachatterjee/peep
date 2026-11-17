@@ -97,6 +97,17 @@ impl Session {
         &self.user_agent
     }
 
+    /// The secret Google's services want a hash of beside the cookies, if the session has
+    /// one.
+    pub fn api_secret(&self, now: f64) -> Option<&str> {
+        ["SAPISID", "__Secure-3PAPISID"].iter().find_map(|name| {
+            self.cookies
+                .iter()
+                .find(|cookie| cookie.name == *name && cookie.applies(CHAT_HOST, "/", now))
+                .map(|cookie| cookie.value.as_str())
+        })
+    }
+
     /// The `Cookie` header for a request to `https://chat.google.com{path}`.
     pub fn cookie_header(&self, path: &str, now: f64) -> String {
         let mut cookies: Vec<&Cookie> = self
@@ -199,6 +210,22 @@ mod tests {
             "COMPASS=COMPASS-value; OSID=OSID-value; SID=SID-value",
             "a path matches only at a segment boundary"
         );
+    }
+
+    #[test]
+    fn the_api_secret_is_the_first_of_googles_two_cookies_for_it() {
+        let mut cookies = signed_in();
+        assert_eq!(
+            Session::new(cookies.clone(), "agent".into(), NOW)
+                .unwrap()
+                .api_secret(NOW),
+            None
+        );
+
+        cookies.push(cookie("__Secure-3PAPISID", ".google.com", "/"));
+        cookies.push(cookie("SAPISID", ".google.com", "/"));
+        let session = Session::new(cookies, "agent".into(), NOW).unwrap();
+        assert_eq!(session.api_secret(NOW), Some("SAPISID-value"));
     }
 
     #[test]

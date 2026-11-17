@@ -9,17 +9,18 @@ use std::{
 };
 
 use base64::Engine;
+use futures::channel::mpsc::{self, UnboundedReceiver};
 use prost::Message;
 use reqwest::{Url, header};
 use tokio::{runtime::Runtime, sync::Mutex};
 
 use super::{
-    Conversation, ConversationId, Directory, Page, Snapshot, Token, User, UserId, conversation,
-    page, wire,
+    Conversation, ConversationId, Directory, Event, Page, Snapshot, Token, User, UserId,
+    conversation, live::Registration, page, wire,
 };
 use crate::session::{self, Session};
 
-const ORIGIN: &str = "https://chat.google.com";
+pub(super) const ORIGIN: &str = "https://chat.google.com";
 const API_PATH: &str = "/api/";
 const BOOTSTRAP_PATH: &str = "/mole/world";
 const PROTOBUF: &str = "application/x-protobuf";
@@ -64,12 +65,17 @@ pub enum Error {
 #[derive(Clone)]
 pub struct Client(Arc<Inner>);
 
-struct Inner {
+pub(super) struct Inner {
     http: reqwest::Client,
+    /// For the live channel, whose requests stay open: it sets no limit on how long one
+    /// takes.
+    pub(super) streaming: reqwest::Client,
     runtime: &'static Runtime,
-    session: Session,
+    pub(super) session: Session,
     /// Fetched on first use, and again when it is old or Google refuses it.
     token: Mutex<Option<Token>>,
+    /// Where the live channel is, read from the page that carries the token.
+    registration: Mutex<Option<Registration>>,
     /// Everyone whose name has been looked up, so no one is looked up twice.
     users: Mutex<HashMap<UserId, User>>,
 }
@@ -90,18 +96,25 @@ impl Client {
                 RUNTIME.get_or_init(|| runtime)
             }
         };
-        let http = reqwest::Client::builder()
-            .user_agent(session.user_agent())
-            // A redirect means Google wants a sign-in; following it would hide that.
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(TIMEOUT)
-            .build()
-            .map_err(|error| Error::Network(error.to_string()))?;
+        let builder = || {
+            reqwest::Client::builder()
+                .user_agent(session.user_agent())
+                // A redirect means Google wants a sign-in; following it would hide that.
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(TIMEOUT)
+        };
+        let build = |builder: reqwest::ClientBuilder| {
+            builder
+                .build()
+                .map_err(|error| Error::Network(error.to_string()))
+        };
         Ok(Self(Arc::new(Inner {
-            http,
+            http: build(builder().timeout(TIMEOUT))?,
+            streaming: build(builder())?,
             runtime,
             session,
             token: Mutex::new(snapshot.token),
+            registration: Mutex::new(None),
             users: Mutex::new(snapshot.directory.users),
         })))
     }
@@ -158,6 +171,14 @@ impl Client {
                 .await
                 .map(|_| ())
         })
+    }
+
+    /// What happens from now on, as it happens. The channel behind it reconnects by itself
+    /// and stops when the receiver is dropped.
+    pub fn events(&self) -> UnboundedReceiver<Event> {
+        let (listener, events) = mpsc::unbounded();
+        self.0.runtime.spawn(self.0.clone().listen(listener));
+        events
     }
 
     /// Runs `work` on the network threads.
@@ -387,7 +408,23 @@ impl Inner {
         }
     }
 
-    async fn token(&self) -> Result<String, Error> {
+    /// Where the live channel is. `fresh` reads the page again, which also renews the
+    /// request token.
+    pub(super) async fn registration(&self, fresh: bool) -> Result<Registration, Error> {
+        let known = self.registration.lock().await.clone();
+        if let (false, Some(registration)) = (fresh, known) {
+            return Ok(registration);
+        }
+        *self.token.lock().await = None;
+        self.token().await?;
+        self.registration
+            .lock()
+            .await
+            .clone()
+            .ok_or(Error::Unreadable("the live channel's registration"))
+    }
+
+    pub(super) async fn token(&self) -> Result<String, Error> {
         let mut token = self.token.lock().await;
         if let Some(token) = &*token
             && session::now() - token.issued < TOKEN_LIFETIME
@@ -432,16 +469,17 @@ impl Inner {
             value: fresh.clone(),
             issued: session::now(),
         });
+        *self.registration.lock().await = Registration::in_page(&page);
         Ok(fresh)
     }
 }
 
-fn network(error: reqwest::Error) -> Error {
+pub(super) fn network(error: reqwest::Error) -> Error {
     Error::Network(error.without_url().to_string())
 }
 
 /// What a reply other than 200 means. Only Google's sign-in page ends the session.
-fn refusal(status: u16, location: Option<&str>, body: &str) -> Error {
+pub(super) fn refusal(status: u16, location: Option<&str>, body: &str) -> Error {
     let to_sign_in = location
         .and_then(|location| Url::parse(location).ok())
         .is_some_and(|url| url.host_str() == Some("accounts.google.com"));

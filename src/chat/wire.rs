@@ -319,8 +319,22 @@ pub struct ChatMessage {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct MessageId {
+    #[prost(message, optional, tag = "1")]
+    pub parent_id: Option<MessageParentId>,
     #[prost(string, tag = "2")]
     pub message_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageParentId {
+    #[prost(message, optional, tag = "4")]
+    pub topic_id: Option<TopicId>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TopicId {
+    #[prost(message, optional, tag = "3")]
+    pub group_id: Option<GroupId>,
 }
 
 /// Stands where a deleted message was.
@@ -382,6 +396,74 @@ pub struct MarkGroupReadstateRequest {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct MarkGroupReadstateResponse {}
+
+/// One thing that happened, as the live channel reports it.
+#[derive(Clone, PartialEq, Message)]
+pub struct Event {
+    #[prost(message, optional, tag = "1")]
+    pub group_id: Option<GroupId>,
+    /// What `body` is about. `bodies` each say their own.
+    #[prost(int32, tag = "3")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "4")]
+    pub body: Option<EventBody>,
+    #[prost(message, repeated, tag = "8")]
+    pub bodies: Vec<EventBody>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EventBody {
+    #[prost(message, optional, tag = "3")]
+    pub group_viewed: Option<GroupViewed>,
+    #[prost(message, optional, tag = "6")]
+    pub message: Option<MessageEvent>,
+    #[prost(int32, tag = "12")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "18")]
+    pub message_deleted: Option<MessageDeleted>,
+    #[prost(message, optional, tag = "32")]
+    pub marked_unread: Option<MarkedUnread>,
+    #[prost(message, optional, tag = "65")]
+    pub read_state: Option<ReadStateUpdated>,
+}
+
+/// A message posted or edited.
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageEvent {
+    #[prost(message, optional, tag = "1")]
+    pub message: Option<ChatMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageDeleted {
+    #[prost(message, optional, tag = "1")]
+    pub message_id: Option<MessageId>,
+}
+
+/// The person opened a conversation, here or on another device.
+#[derive(Clone, PartialEq, Message)]
+pub struct GroupViewed {
+    #[prost(message, optional, tag = "1")]
+    pub group_id: Option<GroupId>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MarkedUnread {
+    #[prost(message, optional, tag = "1")]
+    pub group_id: Option<GroupId>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReadStateUpdated {
+    #[prost(message, optional, tag = "1")]
+    pub group_id: Option<GroupId>,
+    #[prost(int64, tag = "2")]
+    pub last_head_message_create_time: i64,
+    #[prost(int64, tag = "3")]
+    pub most_recent_read_time: i64,
+    #[prost(int64, tag = "4")]
+    pub mark_as_unread_time: i64,
+}
 
 #[cfg(test)]
 mod tests {

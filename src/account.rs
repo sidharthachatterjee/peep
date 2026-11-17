@@ -7,12 +7,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::StreamExt as _;
 use gpui::{AppContext as _, Context, EventEmitter, SharedString, Task};
 
 pub use self::timeline::{Change, Entry, Timeline};
 use crate::{
     cache,
-    chat::{self, Client, ConversationId, Directory, Message, Page, Snapshot},
+    chat::{self, Client, ConversationId, Directory, Event, Message, MessageKind, Page, Snapshot},
     session::{self, Session, SignIn},
     theme::ActiveTheme,
 };
@@ -21,6 +22,11 @@ use crate::{
 const MOST_UNREAD_SHOWN: u32 = 99;
 /// How old the list may get before coming back to Peep reloads it.
 const STALE_AFTER: Duration = Duration::from_secs(20);
+/// With the live channel up, how old the list may be when the channel reconnects before it
+/// is reloaded.
+const RELOAD_ON_RECONNECT_AFTER: Duration = Duration::from_secs(3);
+/// How long a change to the list waits for more changes before the list is reloaded once.
+const SETTLE: Duration = Duration::from_millis(500);
 /// How often Chrome is asked whether the sign-in has finished.
 const SIGN_IN_POLL: Duration = Duration::from_millis(400);
 /// How many of the most recent conversations have their messages loaded ahead of being
@@ -72,10 +78,16 @@ pub struct Account {
     /// What the last launch kept, until a client takes it over.
     kept: Snapshot,
     client: Option<Client>,
+    /// Whether the live channel is up, bringing changes as they happen.
+    connected: bool,
     /// When the list was last asked for.
     asked: Option<Instant>,
     sign_in_task: Option<Task<()>>,
     load_task: Option<Task<()>>,
+    /// Reads the live channel for as long as the client is in use.
+    live_task: Option<Task<()>>,
+    /// Waits out a burst of changes to the list before reloading it.
+    settle_task: Option<Task<()>>,
 }
 
 impl EventEmitter<TimelineChanged> for Account {}
@@ -110,10 +122,33 @@ impl Account {
             live: false,
             kept: Snapshot::default(),
             client: None,
+            connected: false,
             asked: None,
             sign_in_task: None,
             load_task: None,
+            live_task: None,
+            settle_task: None,
         }
+    }
+
+    /// Gives a test account direct messages with these ids, each with one person.
+    #[cfg(test)]
+    pub(crate) fn know(&mut self, ids: &[&str]) {
+        use crate::chat::{Conversation, UserId};
+
+        self.directory.me = Some(UserId("me".into()));
+        self.directory.conversations = ids
+            .iter()
+            .map(|id| Conversation {
+                id: ConversationId::Dm((*id).into()),
+                title: format!("Person {id}").into(),
+                members: Vec::new(),
+                name: None,
+                unread: 0,
+                muted: false,
+                sort_time: 0,
+            })
+            .collect();
     }
 
     pub fn status(&self) -> &Status {
@@ -136,7 +171,7 @@ impl Account {
             return;
         };
         let timeline = self.timelines.entry(conversation.clone()).or_default();
-        if !timeline.is_stale() {
+        if !timeline.is_stale(self.connected) {
             return;
         }
         timeline.loading = true;
@@ -313,12 +348,13 @@ impl Account {
         }));
     }
 
-    /// Reloads the list if it has not been asked for in a while. Until Peep hears about
-    /// new messages as they happen, this is what keeps the list current.
+    /// Reloads the list if it has not been asked for in a while. This keeps the list
+    /// current while the live channel is down; while it is up, changes arrive by themselves.
     pub fn refresh_if_stale(&mut self, cx: &mut Context<Self>) {
-        if self
-            .asked
-            .is_some_and(|asked| asked.elapsed() > STALE_AFTER)
+        if !self.connected
+            && self
+                .asked
+                .is_some_and(|asked| asked.elapsed() > STALE_AFTER)
         {
             self.load(cx);
         }
@@ -355,6 +391,14 @@ impl Account {
     fn connect(&mut self, session: Session, cx: &mut Context<Self>) {
         match Client::new(session, std::mem::take(&mut self.kept)) {
             Ok(client) => {
+                let mut events = client.events();
+                self.live_task = Some(cx.spawn(async move |this, cx| {
+                    while let Some(event) = events.next().await {
+                        if this.update(cx, |this, cx| this.heard(event, cx)).is_err() {
+                            break;
+                        }
+                    }
+                }));
                 self.client = Some(client);
                 self.load(cx);
             }
@@ -407,9 +451,122 @@ impl Account {
         }
     }
 
+    /// Takes in what the live channel reported.
+    pub(crate) fn heard(&mut self, event: Event, cx: &mut Context<Self>) {
+        match event {
+            Event::Connected { gap } => {
+                self.connected = true;
+                if gap {
+                    for timeline in self.timelines.values_mut() {
+                        timeline.outdated = true;
+                    }
+                }
+                // The channel starts from when it connected; the list may be older.
+                if gap
+                    || self
+                        .asked
+                        .is_none_or(|asked| asked.elapsed() > RELOAD_ON_RECONNECT_AFTER)
+                {
+                    self.load(cx);
+                }
+                cx.notify();
+            }
+            Event::Disconnected => self.connected = false,
+            Event::SignedOut => self.signed_out(cx),
+            Event::Message {
+                conversation,
+                message,
+                posted,
+            } => self.message_arrived(conversation, message, posted, cx),
+            Event::Removed {
+                conversation,
+                message,
+            } => {
+                let key: SharedString = conversation.key().into();
+                let directory = &self.directory;
+                let change = self
+                    .timelines
+                    .get_mut(&key)
+                    .and_then(|timeline| timeline.remove(&message, |m| sender(directory, m)));
+                if change.is_some() {
+                    self.changed(&key, change, cx);
+                }
+            }
+            Event::Read {
+                conversation,
+                unread,
+            } => {
+                if let Some(known) = self
+                    .directory
+                    .conversations
+                    .iter_mut()
+                    .find(|known| known.id == conversation)
+                    && (known.unread > 0) != unread
+                {
+                    known.unread = u32::from(unread);
+                    self.rows = rows(&self.directory);
+                    cx.notify();
+                }
+            }
+            Event::ListChanged => self.reload_soon(cx),
+            Event::Other(_) => {}
+        }
+    }
+
+    fn message_arrived(
+        &mut self,
+        conversation: ConversationId,
+        message: Message,
+        posted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let me = self.directory.me.clone();
+        let Some(known) = self
+            .directory
+            .conversations
+            .iter_mut()
+            .find(|known| known.id == conversation)
+        else {
+            // Someone new wrote. Spaces report here too, and Peep does not list those.
+            if posted && matches!(conversation, ConversationId::Dm(_)) {
+                self.reload_soon(cx);
+            }
+            return;
+        };
+        if posted {
+            known.sort_time = known.sort_time.max(message.time);
+            if message.kind == MessageKind::Sent && me.as_ref() != Some(&message.sender) {
+                known.unread = known.unread.saturating_add(1);
+            }
+            self.directory
+                .conversations
+                .sort_by_key(|conversation| std::cmp::Reverse(conversation.sort_time));
+            self.rows = rows(&self.directory);
+        }
+
+        let key: SharedString = conversation.key().into();
+        let directory = &self.directory;
+        let change = self
+            .timelines
+            .get_mut(&key)
+            .and_then(|timeline| timeline.apply(message, posted, |m| sender(directory, m)));
+        self.changed(&key, change, cx);
+    }
+
+    /// Reloads the list once a burst of changes to it has passed.
+    fn reload_soon(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().timer(SETTLE);
+        self.settle_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| this.load(cx)).ok();
+        }));
+    }
+
     /// Google no longer takes the session: forget what was kept for it.
     fn signed_out(&mut self, cx: &mut Context<Self>) {
         self.client = None;
+        self.live_task = None;
+        self.connected = false;
         self.kept = Snapshot::default();
         self.rows.clear();
         self.directory = Directory::default();

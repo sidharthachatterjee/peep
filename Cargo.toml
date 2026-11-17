@@ -16,8 +16,9 @@ prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "gzip", "brotli"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+sha1_smol = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders", "test-support"] }

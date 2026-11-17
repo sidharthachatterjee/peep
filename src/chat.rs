@@ -1,6 +1,7 @@
 //! Google Chat: the people, direct messages and messages of the signed-in account.
 
 mod client;
+mod live;
 mod wire;
 
 use std::{collections::HashMap, sync::Arc};
@@ -110,6 +111,40 @@ pub struct Page {
     /// What to pass as `before` for the page before this one. `None` at the conversation's
     /// start.
     pub older: Option<i64>,
+}
+
+/// Something the live channel reported.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Event {
+    /// The channel is up. With `gap` it could not pick up where it left off, so what
+    /// happened in between is not known.
+    Connected { gap: bool },
+    /// The channel dropped. It reconnects by itself.
+    Disconnected,
+    /// Google no longer accepts the session.
+    SignedOut,
+    /// A message was posted, or one already posted changed: edited, or given a preview of
+    /// a link in it.
+    Message {
+        conversation: ConversationId,
+        message: Message,
+        /// Whether it is new, rather than a change to one already posted.
+        posted: bool,
+    },
+    /// A message was deleted, leaving nothing in its place.
+    Removed {
+        conversation: ConversationId,
+        message: Arc<str>,
+    },
+    /// A conversation was read or marked unread, here or on another device.
+    Read {
+        conversation: ConversationId,
+        unread: bool,
+    },
+    /// The conversations themselves changed: one was added, left, renamed, muted or hidden.
+    ListChanged,
+    /// Anything else, by Google's number for it.
+    Other(i32),
 }
 
 /// What Peep keeps between launches so the list shows at once and the first request
@@ -225,6 +260,116 @@ fn conversation(item: wire::WorldItem, me: &UserId) -> Option<Conversation> {
         muted,
         sort_time: item.sort_timestamp,
     })
+}
+
+/// Google's numbers for the kinds of event Peep acts on.
+mod event {
+    pub const GROUP_VIEWED: i32 = 3;
+    pub const MESSAGE_POSTED: i32 = 6;
+    pub const MESSAGE_UPDATED: i32 = 7;
+    pub const MESSAGE_DELETED: i32 = 8;
+    pub const MARKED_UNREAD: i32 = 37;
+    pub const READ_STATE_UPDATED: i32 = 83;
+    /// Added to or removed from a conversation, a conversation updated, a membership
+    /// changed, hidden or shown, notifications changed, deleted, the whole list refreshed.
+    pub const LIST: [i32; 8] = [1, 2, 5, 15, 16, 18, 30, 76];
+}
+
+impl ConversationId {
+    fn from_wire(id: wire::GroupId) -> Option<Self> {
+        match (id.dm_id, id.space_id) {
+            (Some(dm), _) if !dm.dm_id.is_empty() => Some(Self::Dm(dm.dm_id.into())),
+            (_, Some(space)) if !space.space_id.is_empty() => {
+                Some(Self::Space(space.space_id.into()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What one report from the live channel means. A report can carry several events.
+fn events(report: wire::Event) -> Vec<Event> {
+    let group = report.group_id.and_then(ConversationId::from_wire);
+    let first = report.body.map(|mut body| {
+        if body.kind == 0 {
+            body.kind = report.kind;
+        }
+        body
+    });
+    first
+        .into_iter()
+        .chain(report.bodies)
+        .map(|body| heard(body, group.clone()))
+        .collect()
+}
+
+fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
+    let within =
+        |id: Option<wire::GroupId>| id.and_then(ConversationId::from_wire).or(group.clone());
+    let event =
+        match body.kind {
+            event::MESSAGE_POSTED | event::MESSAGE_UPDATED => body
+                .message
+                .and_then(|event| event.message)
+                .and_then(|message| {
+                    let id = message.id.clone()?;
+                    let conversation = within(
+                        id.parent_id
+                            .and_then(|parent| parent.topic_id)
+                            .and_then(|topic| topic.group_id),
+                    )?;
+                    Some(match self::message(message) {
+                        Some(message) => Event::Message {
+                            conversation,
+                            message,
+                            posted: body.kind == event::MESSAGE_POSTED,
+                        },
+                        None => Event::Removed {
+                            conversation,
+                            message: id.message_id.into(),
+                        },
+                    })
+                }),
+            event::MESSAGE_DELETED => body
+                .message_deleted
+                .and_then(|deleted| deleted.message_id)
+                .and_then(|id| {
+                    let conversation = within(
+                        id.parent_id
+                            .and_then(|parent| parent.topic_id)
+                            .and_then(|topic| topic.group_id),
+                    )?;
+                    Some(Event::Removed {
+                        conversation,
+                        message: id.message_id.into(),
+                    })
+                }),
+            event::GROUP_VIEWED => within(body.group_viewed.and_then(|viewed| viewed.group_id))
+                .map(|conversation| Event::Read {
+                    conversation,
+                    unread: false,
+                }),
+            event::MARKED_UNREAD => within(body.marked_unread.and_then(|marked| marked.group_id))
+                .map(|conversation| Event::Read {
+                    conversation,
+                    unread: true,
+                }),
+            event::READ_STATE_UPDATED => body.read_state.and_then(|state| {
+                let marked = state.mark_as_unread_time > 0;
+                // A message newer than the last one read is reported as a message too,
+                // which is what counts it.
+                if !marked && state.last_head_message_create_time > state.most_recent_read_time {
+                    return None;
+                }
+                Some(Event::Read {
+                    conversation: within(state.group_id)?,
+                    unread: marked,
+                })
+            }),
+            kind if event::LIST.contains(&kind) => Some(Event::ListChanged),
+            _ => None,
+        };
+    event.unwrap_or(Event::Other(body.kind))
 }
 
 const NOTICE: i32 = 2;
@@ -570,6 +715,7 @@ mod tests {
         wire::ChatMessage {
             id: Some(wire::MessageId {
                 message_id: id.into(),
+                parent_id: None,
             }),
             creator: Some(wire::User {
                 user_id: Some(user_id("ada")),
@@ -690,5 +836,123 @@ mod tests {
         );
 
         assert_eq!(message(wire::ChatMessage::default()), None, "no id");
+    }
+
+    fn group(dm: &str) -> wire::GroupId {
+        wire::GroupId {
+            dm_id: Some(wire::DmId { dm_id: dm.into() }),
+            space_id: None,
+        }
+    }
+
+    fn body(kind: i32) -> wire::EventBody {
+        wire::EventBody {
+            kind,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_report_carries_posted_edited_and_deleted_messages() {
+        let dm = ConversationId::Dm("dm-1".into());
+        let mut inside = sent("b", 2, "in its own conversation");
+        inside.id.as_mut().unwrap().parent_id = Some(wire::MessageParentId {
+            topic_id: Some(wire::TopicId {
+                group_id: Some(group("dm-2")),
+            }),
+        });
+        let mut gone = sent("c", 3, "");
+        gone.delete_time = 4;
+        let message = |message| wire::EventBody {
+            message: Some(wire::MessageEvent {
+                message: Some(message),
+            }),
+            ..body(event::MESSAGE_POSTED)
+        };
+        let report = wire::Event {
+            group_id: Some(group("dm-1")),
+            kind: event::MESSAGE_UPDATED,
+            body: Some(wire::EventBody {
+                kind: 0,
+                ..message(sent("a", 1, "edited"))
+            }),
+            bodies: vec![
+                message(inside),
+                message(gone),
+                wire::EventBody {
+                    message_deleted: Some(wire::MessageDeleted {
+                        message_id: Some(wire::MessageId {
+                            message_id: "d".into(),
+                            parent_id: None,
+                        }),
+                    }),
+                    ..body(event::MESSAGE_DELETED)
+                },
+            ],
+        };
+
+        let heard = events(report);
+
+        assert!(
+            matches!(&heard[0], Event::Message { conversation, message, posted: false }
+                if *conversation == dm && &*message.text == "edited"),
+            "the first body takes the report's kind"
+        );
+        assert!(
+            matches!(&heard[1], Event::Message { conversation, posted: true, .. }
+                if *conversation == ConversationId::Dm("dm-2".into())),
+            "a message names its own conversation"
+        );
+        let removed = |id: &str| Event::Removed {
+            conversation: dm.clone(),
+            message: id.into(),
+        };
+        assert_eq!(heard[2..], [removed("c"), removed("d")]);
+    }
+
+    #[test]
+    fn a_report_tells_reading_from_marking_unread_and_from_list_changes() {
+        let dm = ConversationId::Dm("dm-1".into());
+        let read_state = |head, read, marked| wire::EventBody {
+            read_state: Some(wire::ReadStateUpdated {
+                group_id: Some(group("dm-1")),
+                last_head_message_create_time: head,
+                most_recent_read_time: read,
+                mark_as_unread_time: marked,
+            }),
+            ..body(event::READ_STATE_UPDATED)
+        };
+        let report = wire::Event {
+            group_id: Some(group("dm-1")),
+            bodies: vec![
+                body(event::GROUP_VIEWED),
+                body(event::MARKED_UNREAD),
+                read_state(5, 5, 0),
+                read_state(6, 5, 0),
+                read_state(5, 5, 1),
+                body(15),
+                body(29),
+                body(event::MESSAGE_POSTED),
+            ],
+            ..Default::default()
+        };
+
+        let read = |unread| Event::Read {
+            conversation: dm.clone(),
+            unread,
+        };
+        assert_eq!(
+            events(report),
+            [
+                read(false),
+                read(true),
+                read(false),
+                Event::Other(event::READ_STATE_UPDATED),
+                read(true),
+                Event::ListChanged,
+                Event::Other(29),
+                Event::Other(event::MESSAGE_POSTED),
+            ]
+        );
     }
 }
