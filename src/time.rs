@@ -85,6 +85,19 @@ impl Local {
     }
 }
 
+/// How long ago a moment within the last hour was, as in `now` or `12 min`. Both times are
+/// in microseconds since the Unix epoch. `None` for anything longer ago, which is better
+/// said as a time of day.
+pub fn ago(then: i64, now: i64) -> Option<String> {
+    const MINUTE: i64 = 60 * 1_000_000;
+    match (now - then) / MINUTE {
+        // A clock a little ahead of this one is not the future.
+        ..1 => Some("now".to_owned()),
+        minutes @ 1..60 => Some(format!("{minutes} min")),
+        _ => None,
+    }
+}
+
 /// The hour a morning starts at, for "until tomorrow".
 const MORNING: libc::c_int = 8;
 
@@ -116,6 +129,22 @@ fn morning_after(micros: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_last_hour_is_said_as_how_long_ago() {
+        const SECOND: i64 = 1_000_000;
+        let ago = |seconds: i64| ago(1_000 * SECOND, (1_000 + seconds) * SECOND);
+        assert_eq!(ago(0).as_deref(), Some("now"));
+        assert_eq!(ago(59).as_deref(), Some("now"));
+        assert_eq!(
+            ago(-30).as_deref(),
+            Some("now"),
+            "its clock is a little ahead"
+        );
+        assert_eq!(ago(60).as_deref(), Some("1 min"));
+        assert_eq!(ago(59 * 60 + 59).as_deref(), Some("59 min"));
+        assert_eq!(ago(60 * 60), None, "from then on, the time of day");
+    }
 
     fn day(year: i32, month: u32, day: u32, weekday: u32) -> Local {
         Local {

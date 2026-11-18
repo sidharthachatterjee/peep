@@ -95,6 +95,8 @@ pub struct Sizes {
     pub sidebar: Pixels,
     /// The narrowest a list that floats over the window is drawn.
     pub popover_min: Pixels,
+    /// How much of a conversation's width a message's bubble may take.
+    pub bubble_share: f32,
     /// How far past its edges a long list lays rows out, so scrolling never shows a gap.
     pub list_overdraw: Pixels,
     /// The Chrome window Google's sign-in page opens in.
@@ -201,6 +203,7 @@ impl Sizes {
             window_buttons: point(px(13.), px(12.)),
             sidebar: px(280.),
             popover_min: px(220.),
+            bubble_share: 0.72,
             list_overdraw: px(600.),
             sign_in_window: size(px(480.), px(700.)),
             window: size(px(1040.), px(720.)),

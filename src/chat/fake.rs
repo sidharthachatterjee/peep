@@ -13,7 +13,7 @@ use super::{
     Page, Service, Showing, Snapshot, Status, User, UserId,
 };
 
-/// How many messages a page holds.
+/// How many messages a page holds, unless a test says otherwise.
 const PAGE: usize = 3;
 
 /// Something Peep asked of the service.
@@ -48,6 +48,8 @@ struct State {
     asked: Vec<Asked>,
     /// When the newest things happen, if not now.
     now: Option<i64>,
+    /// How many messages a page holds, if not [`PAGE`].
+    page: Option<usize>,
 }
 
 impl Fake {
@@ -131,6 +133,26 @@ impl Fake {
         for known in known.filter(|known| known.id.has_key(conversation)) {
             known.muted = true;
         }
+        drop(state);
+        self
+    }
+
+    /// Gives messages out this many at a time.
+    pub(crate) fn pages_of(self, messages: usize) -> Self {
+        self.0.borrow_mut().page = Some(messages);
+        self
+    }
+
+    /// Changes one message of a conversation, counted from its oldest.
+    pub(crate) fn with_message(
+        self,
+        conversation: &str,
+        index: usize,
+        change: impl FnOnce(&mut Message),
+    ) -> Self {
+        let mut state = self.0.borrow_mut();
+        let messages = state.messages.get_mut(conversation);
+        change(&mut messages.expect("a conversation the service has")[index]);
         drop(state);
         self
     }
@@ -226,7 +248,7 @@ impl Service for Fake {
             let end = before.map_or(all.len(), |before| {
                 all.partition_point(|message| message.time < before)
             });
-            let start = end.saturating_sub(PAGE);
+            let start = end.saturating_sub(state.page.unwrap_or(PAGE));
             Page {
                 messages: all[start..end].to_vec(),
                 older: (start > 0).then(|| all[start].time),
@@ -348,6 +370,9 @@ fn message(id: &str, sender: &str, text: &str, time: i64) -> Message {
         text: text.into(),
         attachments: Vec::new(),
         edited: false,
+        marks: super::marks(text, &[]),
+        reactions: Vec::new(),
+        quote: None,
     }
 }
 

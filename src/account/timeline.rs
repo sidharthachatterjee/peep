@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use gpui::SharedString;
 
 use crate::{
-    chat::{Message, MessageKind, Page},
+    chat::{Mark, Message, MessageKind, Page, Reaction, UserId},
     time::Local,
 };
 
@@ -15,8 +15,15 @@ const RUN_WINDOW: i64 = 5 * 60 * 1_000_000;
 /// asked for again.
 const FRESH_FOR: Duration = Duration::from_secs(5);
 
-/// Who a message is shown as being from: their name, and where their photo is.
-pub(super) type Sender = (SharedString, Option<SharedString>);
+/// How someone is shown as the sender of a message.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Sender {
+    pub name: SharedString,
+    /// Where their photo is, if they have one.
+    pub photo: Option<SharedString>,
+    /// Whether they are the signed-in person.
+    pub me: bool,
+}
 
 /// One message, ready to draw.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,7 +32,10 @@ pub struct Entry {
     pub sender: SharedString,
     /// Where the sender's photo is, if they have one.
     pub photo: Option<SharedString>,
-    /// The time of day it was sent.
+    /// Whether the signed-in person sent it.
+    pub mine: bool,
+    /// When it was sent, in microseconds since the Unix epoch, and as a time of day.
+    pub at: i64,
     pub time: SharedString,
     pub kind: MessageKind,
     pub text: SharedString,
@@ -36,6 +46,12 @@ pub struct Entry {
     pub day: Option<SharedString>,
     /// Whether it starts a run of messages from one person, and so shows who sent it.
     pub leads: bool,
+    /// The parts of the text that are links or name someone.
+    pub marks: Vec<Mark>,
+    /// The emoji people answered it with.
+    pub reactions: Vec<Reaction>,
+    /// The message it answers: who sent that, and what it said.
+    pub quote: Option<(SharedString, SharedString)>,
 }
 
 /// How a timeline's entries changed, so a list showing them can keep its place.
@@ -116,7 +132,7 @@ impl Timeline {
     pub(super) fn merge_newest(
         &mut self,
         page: Page,
-        who: impl Fn(&Message) -> Sender,
+        who: impl Fn(&UserId, &str) -> Sender,
     ) -> Option<Change> {
         self.loading = false;
         self.failed = None;
@@ -175,7 +191,7 @@ impl Timeline {
     pub(super) fn merge_older(
         &mut self,
         page: Page,
-        who: impl Fn(&Message) -> Sender,
+        who: impl Fn(&UserId, &str) -> Sender,
     ) -> Option<Change> {
         self.loading_older = false;
         self.older = page.older;
@@ -206,7 +222,7 @@ impl Timeline {
         &mut self,
         message: Message,
         posted: bool,
-        who: impl Fn(&Message) -> Sender,
+        who: impl Fn(&UserId, &str) -> Sender,
     ) -> Option<Change> {
         if !self.is_loaded() {
             return None;
@@ -243,15 +259,35 @@ impl Timeline {
         Some(change)
     }
 
+    /// Takes in the reactions a message has now.
+    pub(super) fn react(
+        &mut self,
+        id: &str,
+        reactions: Vec<Reaction>,
+        who: impl Fn(&UserId, &str) -> Sender,
+    ) -> Option<Change> {
+        let index = self.messages.iter().position(|known| &*known.id == id)?;
+        if self.messages[index].reactions == reactions {
+            return None;
+        }
+        self.messages[index].reactions = reactions;
+        self.rebuild(who);
+        Some(Change::Updated(index))
+    }
+
     /// Drops a message that was deleted.
-    pub(super) fn remove(&mut self, id: &str, who: impl Fn(&Message) -> Sender) -> Option<Change> {
+    pub(super) fn remove(
+        &mut self,
+        id: &str,
+        who: impl Fn(&UserId, &str) -> Sender,
+    ) -> Option<Change> {
         let index = self.messages.iter().position(|known| &*known.id == id)?;
         self.messages.remove(index);
         self.rebuild(who);
         Some(Change::Removed(index))
     }
 
-    fn rebuild(&mut self, who: impl Fn(&Message) -> Sender) {
+    fn rebuild(&mut self, who: impl Fn(&UserId, &str) -> Sender) {
         let today = Local::now();
         let mut previous: Option<(&Message, Local)> = None;
         self.entries = self
@@ -267,11 +303,13 @@ impl Timeline {
                             || message.time - before.time > RUN_WINDOW
                     });
                 previous = Some((message, local));
-                let (sender, photo) = who(message);
+                let sender = who(&message.sender, &message.sender_name);
                 Entry {
                     id: SharedString::from(message.id.clone()),
-                    sender,
-                    photo,
+                    sender: sender.name,
+                    photo: sender.photo,
+                    mine: sender.me,
+                    at: message.time,
                     time: local.clock().into(),
                     kind: message.kind,
                     text: SharedString::from(message.text.clone()),
@@ -283,6 +321,12 @@ impl Timeline {
                     edited: message.edited,
                     day: new_day.then(|| local.day_label(&today).into()),
                     leads,
+                    marks: message.marks.clone(),
+                    reactions: message.reactions.clone(),
+                    quote: message.quote.as_ref().map(|quote| {
+                        let sender = who(&quote.sender, &quote.sender_name);
+                        (sender.name, SharedString::from(quote.text.clone()))
+                    }),
                 }
             })
             .collect();
@@ -308,6 +352,9 @@ mod tests {
             text: format!("text {id}").into(),
             attachments: Vec::new(),
             edited: false,
+            marks: Vec::new(),
+            reactions: Vec::new(),
+            quote: None,
         }
     }
 
@@ -315,8 +362,12 @@ mod tests {
         Page { messages, older }
     }
 
-    fn name(message: &Message) -> Sender {
-        (SharedString::from(message.sender.0.clone()), None)
+    fn name(person: &UserId, _: &str) -> Sender {
+        Sender {
+            name: SharedString::from(person.0.clone()),
+            photo: None,
+            me: &*person.0 == "me",
+        }
     }
 
     fn ids(timeline: &Timeline) -> Vec<&str> {

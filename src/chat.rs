@@ -178,6 +178,47 @@ pub struct Message {
     /// The names of attached files.
     pub attachments: Vec<Arc<str>>,
     pub edited: bool,
+    /// The parts of the text that are links or name someone, in order.
+    pub marks: Vec<Mark>,
+    /// The emoji people answered it with.
+    pub reactions: Vec<Reaction>,
+    /// The message it answers, if it quotes one.
+    pub quote: Option<Quote>,
+}
+
+/// A part of a message's text that is more than text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mark {
+    /// Where it is in the text, in bytes.
+    pub range: std::ops::Range<usize>,
+    pub kind: MarkKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarkKind {
+    /// Goes to this address when clicked.
+    Link(Arc<str>),
+    /// Names someone.
+    Mention,
+}
+
+/// An emoji and how many people answered a message with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reaction {
+    /// The emoji itself, or the `:name:` of one of the organisation's own.
+    pub emoji: Arc<str>,
+    pub count: u32,
+    /// Whether the signed-in person is one of them.
+    pub mine: bool,
+}
+
+/// A message as it was when another quoted it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Quote {
+    pub sender: UserId,
+    /// The sender's name as the quote carries it, which may be empty.
+    pub sender_name: Arc<str>,
+    pub text: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,6 +314,12 @@ pub enum Event {
     Availability {
         person: UserId,
         availability: Availability,
+    },
+    /// The reactions to a message changed. These are all it has now.
+    Reactions {
+        conversation: ConversationId,
+        message: Arc<str>,
+        reactions: Vec<Reaction>,
     },
     /// Someone started typing in a conversation, or stopped. Google says they are typing
     /// every few seconds for as long as they are, and often does not say they stopped. Only
@@ -411,6 +458,7 @@ mod event {
     pub const MESSAGE_DELETED: i32 = 8;
     pub const STATUS_UPDATED: i32 = 25;
     pub const TYPING_CHANGED: i32 = 29;
+    pub const REACTIONS_UPDATED: i32 = 58;
     pub const AVAILABILITY_UPDATED: i32 = 45;
     pub const MARKED_UNREAD: i32 = 37;
     pub const READ_STATE_UPDATED: i32 = 83;
@@ -530,6 +578,25 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
                 Some(Event::Availability {
                     person: UserId(person.id.into()),
                     availability: availability(changed.state)?,
+                })
+            }),
+            event::REACTIONS_UPDATED => body.reactions.and_then(|updated| {
+                let id = updated.message_id?;
+                let conversation = within(
+                    id.parent_id
+                        .and_then(|parent| parent.topic_id)
+                        .and_then(|topic| topic.group_id),
+                )?;
+                let reactions = updated.reaction_summaries.into_iter();
+                Some(Event::Reactions {
+                    conversation,
+                    message: id.message_id.into(),
+                    reactions: reactions
+                        .filter_map(|one| {
+                            let count = u32::try_from(one.count).unwrap_or(0);
+                            reaction(one.emoji, count, one.current_user_reacted)
+                        })
+                        .collect(),
                 })
             }),
             event::TYPING_CHANGED => body.typing.and_then(|changed| {
@@ -672,6 +739,22 @@ fn message(message: wire::ChatMessage) -> Option<Message> {
         return None;
     }
     let has_text = !message.text_body.is_empty();
+    let marks = marks(&message.text_body, &message.annotations);
+    let reactions = message.reactions.into_iter();
+    let reactions = reactions
+        .filter_map(|one| {
+            let count = u32::try_from(one.count).unwrap_or(0);
+            reaction(one.emoji, count, one.current_user_reacted)
+        })
+        .collect();
+    let quote = message.quoted.map(|quoted| {
+        let creator = quoted.creator.unwrap_or_default();
+        Quote {
+            sender: UserId(creator.user_id.unwrap_or_default().id.into()),
+            sender_name: creator.name.into(),
+            text: quoted.text_body.into(),
+        }
+    });
     let attachments = message
         .annotations
         .into_iter()
@@ -707,7 +790,93 @@ fn message(message: wire::ChatMessage) -> Option<Message> {
         text: message.text_body.into(),
         attachments,
         edited: message.last_edit_time > 0,
+        marks,
+        reactions,
+        quote,
     })
+}
+
+/// One reaction as shown, or `None` for one no one holds any more or with no emoji to show.
+fn reaction(emoji: Option<wire::Emoji>, count: u32, mine: bool) -> Option<Reaction> {
+    let emoji = emoji?;
+    let emoji = match emoji.custom {
+        _ if !emoji.unicode.is_empty() => emoji.unicode,
+        Some(custom) if !custom.shortcode.is_empty() => format!(":{}:", custom.shortcode),
+        _ => return None,
+    };
+    (count > 0).then(|| Reaction {
+        emoji: emoji.into(),
+        count,
+        mine,
+    })
+}
+
+/// The links and the names of people in a message's text: those Google marked, then any
+/// web address it did not. Marks are in order and do not overlap.
+fn marks(text: &str, annotations: &[wire::Annotation]) -> Vec<Mark> {
+    let mut marks: Vec<Mark> = annotations
+        .iter()
+        .filter_map(|annotation| {
+            let range = bytes(text, annotation.start_index, annotation.length)?;
+            let kind = if annotation.user_mention.is_some() {
+                MarkKind::Mention
+            } else {
+                let link = annotation.link.as_ref()?;
+                let address = link.url.as_ref().map(|url| url.url.as_str());
+                // A link without an address of its own goes where its text says.
+                let address = address.filter(|address| !address.is_empty());
+                MarkKind::Link(address.unwrap_or(&text[range.clone()]).into())
+            };
+            Some(Mark { range, kind })
+        })
+        .collect();
+    for (start, word) in words(text) {
+        let address = word.trim_end_matches(|last: char| ".,;:!?)]}'\"".contains(last));
+        let range = start..start + address.len();
+        let is_address = ["https://", "http://"]
+            .iter()
+            .any(|scheme| address.len() > scheme.len() && address.starts_with(scheme));
+        let marked = |mark: &Mark| mark.range.start < range.end && range.start < mark.range.end;
+        if is_address && !marks.iter().any(marked) {
+            marks.push(Mark {
+                range,
+                kind: MarkKind::Link(address.into()),
+            });
+        }
+    }
+    marks.sort_by_key(|mark| mark.range.start);
+    // Google sometimes marks the same text twice.
+    marks.dedup_by(|later, earlier| later.range.start < earlier.range.end);
+    marks
+}
+
+/// Each run of text between spaces and line breaks, with where it starts.
+fn words(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.split_whitespace().map(move |word| {
+        // `word` is a slice of `text`, so its address says where it starts.
+        (word.as_ptr() as usize - text.as_ptr() as usize, word)
+    })
+}
+
+/// The bytes of `text` that a run of UTF-16 code units covers, as Google counts them.
+/// `None` when it is empty or does not fall on whole characters inside the text.
+fn bytes(text: &str, start: i32, length: i32) -> Option<std::ops::Range<usize>> {
+    let (start, length) = (usize::try_from(start).ok()?, usize::try_from(length).ok()?);
+    if length == 0 {
+        return None;
+    }
+    let mut units = 0;
+    let mut range = None..None;
+    for (index, character) in text.char_indices().chain([(text.len(), ' ')]) {
+        if units == start {
+            range.start = Some(index);
+        }
+        if units == start + length {
+            range.end = Some(index);
+        }
+        units += character.len_utf16();
+    }
+    Some(range.start?..range.end?)
 }
 
 #[cfg(test)]
@@ -1218,6 +1387,7 @@ mod tests {
                 state_expiry_timestamp_usec: expires,
                 emoji: Some(wire::Emoji {
                     unicode: emoji.into(),
+                    custom: None,
                 }),
             }),
         }
@@ -1325,6 +1495,149 @@ mod tests {
                 },
                 Event::Other(event::STATUS_UPDATED),
             ]
+        );
+    }
+
+    #[test]
+    fn a_message_carries_its_links_the_people_it_names_its_reactions_and_what_it_quotes() {
+        let text = "😀 see docs and https://example.com/a, @Ada (www.example.org)";
+        let units = |part: &str| {
+            let start = text.find(part).unwrap();
+            let before = text[..start].encode_utf16().count() as i32;
+            (before, part.encode_utf16().count() as i32)
+        };
+        let annotation = |part: &str| {
+            let (start_index, length) = units(part);
+            wire::Annotation {
+                start_index,
+                length,
+                ..Default::default()
+            }
+        };
+        let emoji = |unicode: &str, shortcode: &str| {
+            Some(wire::Emoji {
+                unicode: unicode.into(),
+                custom: (!shortcode.is_empty()).then(|| wire::CustomEmoji {
+                    shortcode: shortcode.into(),
+                }),
+            })
+        };
+        let reaction = |emoji, count, current_user_reacted| wire::Reaction {
+            emoji,
+            count,
+            current_user_reacted,
+        };
+        let sent = wire::ChatMessage {
+            text_body: text.into(),
+            annotations: vec![
+                wire::Annotation {
+                    link: Some(wire::Link {
+                        title: "Docs".into(),
+                        url: Some(wire::SafeUrl {
+                            url: "https://docs.example.com".into(),
+                        }),
+                    }),
+                    ..annotation("docs")
+                },
+                wire::Annotation {
+                    user_mention: Some(wire::UserMention::default()),
+                    ..annotation("@Ada")
+                },
+                // A preview of a link covers none of the text.
+                wire::Annotation {
+                    link: Some(wire::Link::default()),
+                    ..Default::default()
+                },
+            ],
+            reactions: vec![
+                reaction(emoji("👍", ""), 2, true),
+                reaction(emoji("", "engine"), 1, false),
+                reaction(emoji("🎉", ""), 0, false),
+                reaction(None, 4, false),
+            ],
+            quoted: Some(wire::QuotedMessage {
+                creator: Some(wire::User {
+                    user_id: Some(wire::UserId { id: "me".into() }),
+                    ..Default::default()
+                }),
+                text_body: "Where are the docs?".into(),
+            }),
+            ..sent("m1", 5, "")
+        };
+        let message = message(sent).unwrap();
+
+        let marked: Vec<(&str, &MarkKind)> = message
+            .marks
+            .iter()
+            .map(|mark| (&text[mark.range.clone()], &mark.kind))
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                ("docs", &MarkKind::Link("https://docs.example.com".into())),
+                (
+                    "https://example.com/a",
+                    &MarkKind::Link("https://example.com/a".into())
+                ),
+                ("@Ada", &MarkKind::Mention),
+            ],
+            "a web address Google did not mark is still a link, without the comma after it"
+        );
+        let reactions: Vec<(&str, u32, bool)> = message
+            .reactions
+            .iter()
+            .map(|one| (&*one.emoji, one.count, one.mine))
+            .collect();
+        assert_eq!(reactions, [("👍", 2, true), (":engine:", 1, false)]);
+        let quote = message.quote.unwrap();
+        assert_eq!(
+            (&*quote.sender.0, &*quote.text),
+            ("me", "Where are the docs?")
+        );
+    }
+
+    #[test]
+    fn a_report_carries_all_the_reactions_a_message_has_now() {
+        let updated = wire::EventBody {
+            reactions: Some(wire::ReactionsUpdated {
+                message_id: Some(wire::MessageId {
+                    message_id: "m1".into(),
+                    parent_id: Some(wire::MessageParentId {
+                        topic_id: Some(wire::TopicId {
+                            group_id: Some(wire::GroupId {
+                                dm_id: Some(wire::DmId { dm_id: "d".into() }),
+                                space_id: None,
+                            }),
+                        }),
+                    }),
+                }),
+                reaction_summaries: vec![wire::ReactionSummary {
+                    emoji: Some(wire::Emoji {
+                        unicode: "👍".into(),
+                        custom: None,
+                    }),
+                    count: 3,
+                    current_user_reacted: true,
+                }],
+            }),
+            ..body(event::REACTIONS_UPDATED)
+        };
+        let report = wire::Event {
+            bodies: vec![updated],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            events(report),
+            [Event::Reactions {
+                conversation: ConversationId::Dm("d".into()),
+                message: "m1".into(),
+                reactions: vec![Reaction {
+                    emoji: "👍".into(),
+                    count: 3,
+                    mine: true,
+                }],
+            }]
         );
     }
 

@@ -1,16 +1,22 @@
+use std::time::Duration;
+
 use gpui::{
     App, Context, Entity, Focusable as _, IntoElement, ListAlignment, ListScrollEvent, ListState,
-    Render, SharedString, Subscription, Window, div, list, prelude::*,
+    Render, SharedString, Subscription, Task, Window, div, list, prelude::*,
 };
 
 use super::composer::Composer;
 use crate::{
     account::{Account, Change, Entry, Row, TimelineChanged},
     chat::{MessageKind, Presence},
+    session,
     theme::ActiveTheme,
+    time,
     ui::{Avatar, Button, Color, Divider, Label, MessageRow, TextSize},
 };
 
+/// How often messages that say how long ago they were sent are brought up to date.
+const MINUTE: Duration = Duration::from_secs(60);
 /// How near the oldest loaded message scrolling comes before older ones are asked for.
 const LOAD_OLDER_WITHIN: usize = 10;
 
@@ -21,6 +27,8 @@ pub struct Messages {
     /// One row per entry of the open conversation's timeline.
     list: ListState,
     composer: Entity<Composer>,
+    /// Redraws once a minute while messages say how long ago they were sent.
+    _minutes: Task<()>,
     _subscriptions: [Subscription; 3],
 }
 
@@ -47,6 +55,19 @@ impl Messages {
                 cx.observe_window_activation(window, |this, window, cx| this.attend(window, cx)),
             ],
             composer: cx.new(|cx| Composer::new(account.clone(), cx)),
+            _minutes: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(MINUTE).await;
+                    let redrawn = this.update(cx, |this, cx| {
+                        if this.shows_recent(cx) {
+                            cx.notify();
+                        }
+                    });
+                    if redrawn.is_err() {
+                        return;
+                    }
+                }
+            }),
             account,
             conversation: None,
             list,
@@ -122,6 +143,16 @@ impl Messages {
         cx.notify();
     }
 
+    /// Whether the newest message showing says how long ago it was sent.
+    fn shows_recent(&self, cx: &App) -> bool {
+        let now = (session::now() * 1_000_000.) as i64;
+        self.conversation
+            .as_ref()
+            .and_then(|conversation| self.account.read(cx).timeline(conversation))
+            .and_then(|timeline| timeline.entries().last())
+            .is_some_and(|newest| time::ago(newest.at, now).is_some())
+    }
+
     fn entry_count(&self, cx: &App) -> usize {
         self.conversation
             .as_ref()
@@ -160,13 +191,14 @@ impl Render for Messages {
             Some(timeline) if !timeline.entries().is_empty() => {
                 let account = self.account.clone();
                 let conversation = conversation.clone();
+                let now = (session::now() * 1_000_000.) as i64;
                 list(self.list.clone(), move |index, _, cx| {
                     let entry = account
                         .read(cx)
                         .timeline(&conversation)
                         .and_then(|timeline| timeline.entries().get(index));
                     match entry {
-                        Some(entry) => row(entry).into_any_element(),
+                        Some(entry) => row(entry, now).into_any_element(),
                         None => div().into_any_element(),
                     }
                 })
@@ -257,7 +289,9 @@ fn status_line(row: &Row) -> Option<SharedString> {
     })
 }
 
-fn row(entry: &Entry) -> MessageRow {
+/// One entry as its row. `now` is the time, in microseconds since the Unix epoch: a message
+/// from the last hour says how long ago it was.
+fn row(entry: &Entry, now: i64) -> MessageRow {
     if entry.kind == MessageKind::Notice {
         let notice = MessageRow::notice(entry.text.clone());
         return match &entry.day {
@@ -265,11 +299,21 @@ fn row(entry: &Entry) -> MessageRow {
             None => notice,
         };
     }
-    let mut row = MessageRow::new(entry.sender.clone(), entry.time.clone())
+    let time = time::ago(entry.at, now).map_or(entry.time.clone(), SharedString::from);
+    let mut row = MessageRow::new(entry.id.clone(), entry.sender.clone(), time)
+        .mine(entry.mine)
         .photo(entry.photo.clone())
         .text(entry.text.clone())
+        .marks(entry.marks.clone())
         .continues(!entry.leads)
         .edited(entry.edited);
+    if let Some((sender, text)) = &entry.quote {
+        row = row.quote(sender.clone(), text.clone());
+    }
+    for reaction in &entry.reactions {
+        let emoji = SharedString::from(reaction.emoji.clone());
+        row = row.reaction(emoji, reaction.count, reaction.mine);
+    }
     if entry.kind == MessageKind::Deleted {
         row = row.deleted();
     }
@@ -317,6 +361,9 @@ mod tests {
                 text: format!("Message number {number}").into(),
                 attachments: Vec::new(),
                 edited: false,
+                marks: Vec::new(),
+                reactions: Vec::new(),
+                quote: None,
             })
             .collect();
         Page { messages, older }

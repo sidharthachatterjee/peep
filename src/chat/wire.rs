@@ -148,12 +148,6 @@ pub struct CustomStatus {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct Emoji {
-    #[prost(string, tag = "1")]
-    pub unicode: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
 pub struct GetUserPresenceRequest {
     #[prost(message, repeated, tag = "1")]
     pub user_ids: Vec<UserId>,
@@ -401,6 +395,11 @@ pub struct ChatMessage {
     /// Above zero once the message is edited.
     #[prost(int64, tag = "17")]
     pub last_edit_time: i64,
+    #[prost(message, repeated, tag = "21")]
+    pub reactions: Vec<Reaction>,
+    /// The message this one answers, as it was then.
+    #[prost(message, optional, tag = "37")]
+    pub quoted: Option<QuotedMessage>,
     /// 2 is a message from Google Chat itself, such as someone joining.
     #[prost(int32, tag = "28")]
     pub message_type: i32,
@@ -496,6 +495,60 @@ pub struct TypingStateChanged {
     pub context: Option<TypingContext>,
 }
 
+/// An emoji and how many people answered a message with it.
+#[derive(Clone, PartialEq, Message)]
+pub struct Reaction {
+    #[prost(message, optional, tag = "1")]
+    pub emoji: Option<Emoji>,
+    #[prost(int32, tag = "2")]
+    pub count: i32,
+    #[prost(bool, tag = "3")]
+    pub current_user_reacted: bool,
+}
+
+/// One or the other: an emoji everyone has, or one of the organisation's own.
+#[derive(Clone, PartialEq, Message)]
+pub struct Emoji {
+    #[prost(string, tag = "1")]
+    pub unicode: String,
+    #[prost(message, optional, tag = "2")]
+    pub custom: Option<CustomEmoji>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CustomEmoji {
+    /// Its name, without colons.
+    #[prost(string, tag = "3")]
+    pub shortcode: String,
+}
+
+/// All the reactions a message has now, as the live channel reports them.
+#[derive(Clone, PartialEq, Message)]
+pub struct ReactionsUpdated {
+    #[prost(message, optional, tag = "1")]
+    pub message_id: Option<MessageId>,
+    #[prost(message, repeated, tag = "2")]
+    pub reaction_summaries: Vec<ReactionSummary>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReactionSummary {
+    #[prost(message, optional, tag = "1")]
+    pub emoji: Option<Emoji>,
+    #[prost(int64, tag = "3")]
+    pub count: i64,
+    #[prost(bool, tag = "4")]
+    pub current_user_reacted: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct QuotedMessage {
+    #[prost(message, optional, tag = "5")]
+    pub creator: Option<User>,
+    #[prost(string, tag = "6")]
+    pub text_body: String,
+}
+
 /// Stands where a deleted message was.
 #[derive(Clone, PartialEq, Message)]
 pub struct Tombstone {
@@ -506,7 +559,7 @@ pub struct Tombstone {
 /// Something attached to a message or marked within its text.
 #[derive(Clone, PartialEq, Message)]
 pub struct Annotation {
-    /// 6 is a mention of someone, 11 a video call.
+    /// 1 is a link, 6 a mention of someone, 11 a video call.
     #[prost(int32, tag = "1")]
     pub kind: i32,
     /// Where in the text it is, in UTF-16 code units.
@@ -612,6 +665,8 @@ pub struct EventBody {
     pub marked_unread: Option<MarkedUnread>,
     #[prost(message, optional, tag = "38")]
     pub availability: Option<Availability>,
+    #[prost(message, optional, tag = "50")]
+    pub reactions: Option<ReactionsUpdated>,
     #[prost(message, optional, tag = "65")]
     pub read_state: Option<ReadStateUpdated>,
 }

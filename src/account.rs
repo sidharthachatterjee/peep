@@ -12,6 +12,7 @@ use std::{
 use futures::StreamExt as _;
 use gpui::{AppContext as _, Context, EventEmitter, SharedString, Task};
 
+use self::timeline::Sender;
 pub use self::timeline::{Change, Entry, Timeline};
 use crate::{
     cache,
@@ -581,7 +582,7 @@ impl Account {
         let directory = &self.directory;
         let timeline = self.timelines.entry(conversation.clone()).or_default();
         let change = match page {
-            Ok(page) => timeline.merge_newest(page, |message| sender_of(directory, message)),
+            Ok(page) => timeline.merge_newest(page, |id, name| sender_of(directory, id, name)),
             Err(error) => {
                 timeline.loading = false;
                 // A failed reload leaves the messages already showing in place.
@@ -605,7 +606,7 @@ impl Account {
             return;
         };
         let change = match page {
-            Ok(page) => timeline.merge_older(page, |message| sender_of(directory, message)),
+            Ok(page) => timeline.merge_older(page, |id, name| sender_of(directory, id, name)),
             Err(_) => {
                 // Scrolling up again asks again.
                 timeline.loading_older = false;
@@ -823,10 +824,9 @@ impl Account {
             } => {
                 let key: SharedString = conversation.key().into();
                 let directory = &self.directory;
-                let change = self
-                    .timelines
-                    .get_mut(&key)
-                    .and_then(|timeline| timeline.remove(&message, |m| sender_of(directory, m)));
+                let change = self.timelines.get_mut(&key).and_then(|timeline| {
+                    timeline.remove(&message, |id, name| sender_of(directory, id, name))
+                });
                 if change.is_some() {
                     self.changed(&key, change, cx);
                 }
@@ -874,6 +874,23 @@ impl Account {
                 self.reported.insert(person);
                 self.statuses_changed(cx);
             }
+            Event::Reactions {
+                conversation,
+                message,
+                reactions,
+            } => {
+                let key: SharedString = conversation.key().into();
+                let directory = &self.directory;
+                let timeline = self.timelines.get_mut(&key);
+                let change = timeline.and_then(|timeline| {
+                    timeline.react(&message, reactions, |id, name| {
+                        sender_of(directory, id, name)
+                    })
+                });
+                if change.is_some() {
+                    self.changed(&key, change, cx);
+                }
+            }
             Event::Typing {
                 conversation,
                 person,
@@ -919,7 +936,8 @@ impl Account {
                     let incoming = Incoming {
                         conversation: key.clone(),
                         title: SharedString::from(known.title.clone()),
-                        sender: sender_of(&self.directory, &message).0,
+                        sender: sender_of(&self.directory, &message.sender, &message.sender_name)
+                            .name,
                         message: SharedString::from(message.id.clone()),
                         text: preview(&message),
                     };
@@ -937,10 +955,9 @@ impl Account {
         }
 
         let directory = &self.directory;
-        let change = self
-            .timelines
-            .get_mut(&key)
-            .and_then(|timeline| timeline.apply(message, posted, |m| sender_of(directory, m)));
+        let change = self.timelines.get_mut(&key).and_then(|timeline| {
+            timeline.apply(message, posted, |id, name| sender_of(directory, id, name))
+        });
         self.changed(&key, change, cx);
     }
 
@@ -1059,6 +1076,9 @@ impl Account {
             text: draft.text.clone().into(),
             attachments: Vec::new(),
             edited: false,
+            marks: Vec::new(),
+            reactions: Vec::new(),
+            quote: None,
         };
         self.message_arrived(id.clone(), shown, true, cx);
         // The next thing typed is a new message, said to be typed at once.
@@ -1073,7 +1093,7 @@ impl Account {
                     let directory = &this.directory;
                     let timeline = this.timelines.get_mut(&conversation);
                     let change = timeline.and_then(|timeline| {
-                        timeline.remove(&message_id, |m| sender_of(directory, m))
+                        timeline.remove(&message_id, |id, name| sender_of(directory, id, name))
                     });
                     this.changed(&conversation, change, cx);
                 }
@@ -1145,12 +1165,17 @@ fn now() -> i64 {
     (session::now() * 1_000_000.) as i64
 }
 
-/// Who a message is shown as being from.
-fn sender_of(directory: &Directory, message: &Message) -> (SharedString, Option<SharedString>) {
-    let known = directory.users.get(&message.sender);
+/// How someone is shown as the sender of a message. `carried` is the name the message
+/// itself gives them, used when nothing else is known of them.
+fn sender_of(directory: &Directory, person: &UserId, carried: &str) -> Sender {
+    let known = directory.users.get(person);
     let photo = known.and_then(|user| photo(&user.photo));
-    if directory.me.as_ref() == Some(&message.sender) {
-        return (YOU.into(), photo);
+    if directory.me.as_ref() == Some(person) {
+        return Sender {
+            name: YOU.into(),
+            photo,
+            me: true,
+        };
     }
     let name = known
         .map(|user| {
@@ -1163,10 +1188,14 @@ fn sender_of(directory: &Directory, message: &Message) -> (SharedString, Option<
         .filter(|name| !name.is_empty());
     let name = match name {
         Some(name) => SharedString::from(name.clone()),
-        None if !message.sender_name.is_empty() => SharedString::from(message.sender_name.clone()),
+        None if !carried.is_empty() => SharedString::from(carried.to_owned()),
         None => UNKNOWN_SENDER.into(),
     };
-    (name, photo)
+    Sender {
+        name,
+        photo,
+        me: false,
+    }
 }
 
 /// A message in a line or two, for a notification.
@@ -1369,9 +1398,13 @@ mod tests {
                 text: "".into(),
                 attachments: Vec::new(),
                 edited: false,
+                marks: Vec::new(),
+                reactions: Vec::new(),
+                quote: None,
             };
-            let (name, photo) = sender_of(&directory, &message);
-            (name.to_string(), photo.map(|photo| photo.to_string()))
+            let sender = sender_of(&directory, &message.sender, &message.sender_name);
+            let photo = sender.photo.map(|photo| photo.to_string());
+            (sender.name.to_string(), photo)
         };
 
         assert_eq!(from("me", ""), ("You".into(), Some("//photos/me".into())));

@@ -10,7 +10,7 @@ use gpui::{
     div, prelude::*,
 };
 use peep::{
-    chat::Presence,
+    chat::{Mark, MarkKind, Presence},
     theme::{self, ActiveTheme, Mode, Theme},
     ui::{
         self, Avatar, Badge, Button, ButtonVariant, Checkbox, Color, ControlSize, Divider,
@@ -595,28 +595,60 @@ fn avatars_and_badges(theme: &Theme) -> Div {
 }
 
 fn messages(theme: &Theme) -> Div {
+    let link = "https://example.com/bernoulli";
+    let text = format!("The method is written up at {link} for @Grace Hopper to check.");
+    let at = |part: &str| {
+        let start = text.find(part).unwrap_or(0);
+        start..start + part.len()
+    };
+    let marks = vec![
+        Mark {
+            range: at(link),
+            kind: MarkKind::Link(link.into()),
+        },
+        Mark {
+            range: at("@Grace Hopper"),
+            kind: MarkKind::Mention,
+        },
+    ];
     let conversation = Surface::new(Elevation::Flat)
         .child(
-            MessageRow::new("Ada Lovelace", "09:12")
+            MessageRow::new("m1", "Ada Lovelace", "09:12")
                 .day("Yesterday")
-                .text("The engine is ready for its first run."),
+                .text("The engine is ready for its first run.")
+                .reaction("🎉", 2, false)
+                .reaction("👍", 1, true),
         )
         .child(
-            MessageRow::new("Ada Lovelace", "09:12")
+            MessageRow::new("m2", "Ada Lovelace", "09:12")
                 .continues(true)
                 .text("I have punched the cards for the Bernoulli numbers. If they come out right we should write the method up, with a table of every step so anyone can follow it.")
                 .edited(true),
         )
         .child(MessageRow::notice("Grace Hopper joined"))
         .child(
-            MessageRow::new("You", "09:20")
+            MessageRow::new("m3", "You", "09:20")
+                .mine(true)
                 .day("Today")
+                .quote("Ada Lovelace", "The engine is ready for its first run.")
                 .text("Sending the notes now.")
                 .attachment("Notes on the engine.pdf"),
         )
-        .child(MessageRow::new("You", "09:21").continues(true).deleted())
-        .child(MessageRow::new("Grace Hopper", "09:30").attachment("Video call"))
-        .child(MessageRow::new("Grace Hopper", "09:31").continues(true))
+        .child(
+            MessageRow::new("m4", "You", "09:21")
+                .mine(true)
+                .continues(true)
+                .text(text.clone())
+                .marks(marks.clone())
+                .reaction(":engine:", 3, false),
+        )
+        .child(MessageRow::new("m5", "You", "09:21").mine(true).continues(true).deleted())
+        .child(
+            MessageRow::new("m6", "Grace Hopper", "5 min")
+                .text(text)
+                .marks(marks),
+        )
+        .child(MessageRow::new("m7", "Grace Hopper", "5 min").continues(true).attachment("Video call"))
         .child(div().h(theme.spacing.md));
 
     section("Messages", theme).child(div().max_w(theme.size.window_min.width).child(conversation))

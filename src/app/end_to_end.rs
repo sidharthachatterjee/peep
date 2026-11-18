@@ -6,7 +6,8 @@ use gpui::{Entity, SharedString, TestAppContext, VisualTestContext};
 
 use super::*;
 use crate::chat::{
-    Availability, ConversationId, Draft, Event, Mention, Presence, Status as PersonStatus, UserId,
+    Availability, ConversationId, Draft, Event, Mention, Presence, Reaction,
+    Status as PersonStatus, UserId,
     fake::{Asked, Fake},
 };
 
@@ -623,4 +624,47 @@ fn pausing_and_do_not_disturb_keep_banners_away(cx: &mut TestAppContext) {
         ["nothing", "nothing", "Ada: Three (with sound)"],
         "paused, then not to be disturbed, then neither"
     );
+}
+
+#[gpui::test]
+fn reactions_show_as_they_change_and_my_messages_are_told_from_others(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (account, cx) = start(&service, cx);
+    cx.simulate_keystrokes("tab down");
+    settle(cx);
+    let shown = |cx: &mut VisualTestContext| {
+        account.read_with(cx, |account, _| {
+            let entries = account.timeline(&"dm/ada-dm".into()).unwrap().entries();
+            let shown = entries.iter().map(|entry| {
+                let reactions: Vec<String> = entry
+                    .reactions
+                    .iter()
+                    .map(|one| format!("{}{}", one.emoji, one.count))
+                    .collect();
+                (entry.mine, reactions.join(" "))
+            });
+            shown.collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(shown(cx), [(true, String::new()), (false, String::new())]);
+
+    service.say(Event::Reactions {
+        conversation: ConversationId::Dm("ada-dm".into()),
+        message: "ada-1".into(),
+        reactions: vec![Reaction {
+            emoji: "👍".into(),
+            count: 2,
+            mine: true,
+        }],
+    });
+    settle(cx);
+    assert_eq!(shown(cx), [(true, String::new()), (false, "👍2".into())]);
+
+    service.say(Event::Reactions {
+        conversation: ConversationId::Dm("ada-dm".into()),
+        message: "ada-1".into(),
+        reactions: Vec::new(),
+    });
+    settle(cx);
+    assert_eq!(shown(cx)[1].1, "", "the last one was taken back");
 }

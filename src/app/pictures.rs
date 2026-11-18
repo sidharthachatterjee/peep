@@ -10,7 +10,10 @@ use gpui::{AnyWindowHandle, HeadlessAppContext, Keystroke};
 
 use super::*;
 use crate::{
-    chat::{Availability, ConversationId, Event, Status as PersonStatus, UserId, fake::Fake},
+    chat::{
+        Availability, ConversationId, Event, Quote, Reaction, Status as PersonStatus, UserId,
+        fake::Fake,
+    },
     theme::{self, Mode},
 };
 
@@ -189,6 +192,14 @@ fn an_afternoon() -> i64 {
     seconds * 1_000_000
 }
 
+fn reaction(emoji: &str, count: u32, mine: bool) -> Reaction {
+    Reaction {
+        emoji: emoji.into(),
+        count,
+        mine,
+    }
+}
+
 fn doing(availability: Availability, quiet: bool, note: &str) -> PersonStatus {
     PersonStatus {
         availability,
@@ -206,7 +217,11 @@ fn people() -> Fake {
             &[
                 ("ada lovelace", "Did the cards arrive?"),
                 ("me", "This morning. All forty of them, in order."),
-                ("me", "I will run the first set after lunch."),
+                (
+                    "me",
+                    "I will run the first set after lunch. The steps are at \
+                     https://example.com/engine/first-run if you want to follow along.",
+                ),
                 (
                     "ada lovelace",
                     "Wonderful. Mind the ninth: its third column was punched twice, so it may \
@@ -229,6 +244,18 @@ fn people() -> Fake {
             190,
             2,
         )
+        .pages_of(8)
+        .with_message("dm/ada lovelace-dm", 1, |message| {
+            message.reactions = vec![reaction("🎉", 1, false)];
+        })
+        .with_message("dm/ada lovelace-dm", 3, |message| {
+            message.reactions = vec![reaction("👍", 2, true), reaction(":engine:", 1, false)];
+            message.quote = Some(Quote {
+                sender: UserId("me".into()),
+                sender_name: "".into(),
+                text: "I will run the first set after lunch.".into(),
+            });
+        })
         .conversation("Katherine Johnson", &[("me", "Numbers attached.")], 1500, 1)
         .conversation("Margaret Hamilton", &[("me", "Thank you!")], 4400, 1)
         .status("ada lovelace", doing(Availability::Active, false, ""))
