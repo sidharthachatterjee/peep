@@ -926,17 +926,19 @@ fn photo(address: &str) -> Option<SharedString> {
 }
 
 /// The people to watch: those in the rows the list shows and a little beyond, and the
-/// person the open conversation is with.
+/// person the open conversation is with. A list showing no rows has no one beyond them.
 fn people_in_view(
     rows: &[Row],
     in_view: &Range<usize>,
     open: &Option<SharedString>,
 ) -> Vec<UserId> {
-    let start = in_view
-        .start
-        .saturating_sub(WATCHED_BEYOND_VIEW)
-        .min(rows.len());
-    let end = (in_view.end + WATCHED_BEYOND_VIEW).min(rows.len());
+    let beyond = if in_view.is_empty() {
+        0
+    } else {
+        WATCHED_BEYOND_VIEW
+    };
+    let start = in_view.start.saturating_sub(beyond).min(rows.len());
+    let end = (in_view.end + beyond).min(rows.len());
     let open = rows
         .iter()
         .find(|row| open.as_ref() == Some(&row.id))
@@ -1149,6 +1151,7 @@ mod tests {
 
         assert_eq!(watched(0..200, None).len(), MOST_WATCHED);
         assert_eq!(watched(500..600, None), Vec::<String>::new());
+        assert_eq!(watched(0..0, None), Vec::<String>::new(), "no list, no one");
     }
 
     #[gpui::test]
