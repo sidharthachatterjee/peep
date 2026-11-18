@@ -4,6 +4,8 @@ mod conversations;
 #[cfg(test)]
 mod end_to_end;
 mod messages;
+#[cfg(test)]
+mod pictures;
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{

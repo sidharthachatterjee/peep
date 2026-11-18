@@ -41,6 +41,8 @@ struct State {
     signed_out: bool,
     listeners: Vec<UnboundedSender<Event>>,
     asked: Vec<Asked>,
+    /// When the newest things happen, if not now.
+    now: Option<i64>,
 }
 
 impl Fake {
@@ -49,6 +51,13 @@ impl Fake {
         let fake = Self::default();
         fake.0.borrow_mut().directory.me = Some(UserId("me".into()));
         fake
+    }
+
+    /// Has everything happen around a set time, in microseconds since the Unix epoch, rather
+    /// than now. Call it before adding conversations.
+    pub(crate) fn around(self, time: i64) -> Self {
+        self.0.borrow_mut().now = Some(time);
+        self
     }
 
     /// Adds a direct message with one person, whose id is their name in lower case. Its
@@ -63,7 +72,7 @@ impl Fake {
     ) -> Self {
         let person = UserId(name.to_lowercase().into());
         let id = ConversationId::Dm(format!("{}-dm", person.0).into());
-        let newest = time(minutes_ago);
+        let newest = self.time(minutes_ago);
         let messages: Vec<Message> = messages
             .iter()
             .enumerate()
@@ -130,8 +139,9 @@ impl Fake {
     pub(crate) fn post(&self, conversation: &str, sender: &str, text: &str) {
         let (id, message) = {
             let mut state = self.0.borrow_mut();
+            let now = state.now.unwrap_or_else(now);
             let kept = state.messages.entry(conversation.to_owned()).or_default();
-            let message = message(&format!("posted-{}", kept.len()), sender, text, time(0));
+            let message = message(&format!("posted-{}", kept.len()), sender, text, now);
             kept.push(message.clone());
             let known = state
                 .directory
@@ -157,6 +167,11 @@ impl Fake {
     /// What Peep has asked since this was last called, in order.
     pub(crate) fn asked(&self) -> Vec<Asked> {
         std::mem::take(&mut self.0.borrow_mut().asked)
+    }
+
+    /// The time `minutes_ago`, in microseconds since the Unix epoch.
+    fn time(&self, minutes_ago: i64) -> i64 {
+        self.0.borrow().now.unwrap_or_else(now) - minutes_ago * MINUTE
     }
 
     /// Notes what was asked and gives the state to answer from.
@@ -263,9 +278,9 @@ impl Service for Fake {
 
 const MINUTE: i64 = 60_000_000;
 
-/// The time `minutes_ago`, in microseconds since the Unix epoch.
-fn time(minutes_ago: i64) -> i64 {
-    (crate::session::now() * 1_000_000.) as i64 - minutes_ago * MINUTE
+/// Now, in microseconds since the Unix epoch.
+fn now() -> i64 {
+    (crate::session::now() * 1_000_000.) as i64
 }
 
 fn message(id: &str, sender: &str, text: &str, time: i64) -> Message {

@@ -3707,6 +3707,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "gpui",
+ "gpui_apple",
  "gpui_platform",
  "image",
  "libc",
