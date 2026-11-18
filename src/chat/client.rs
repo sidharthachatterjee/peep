@@ -13,8 +13,10 @@ use tokio::{
 };
 
 use super::{
-    Conversation, ConversationId, Directory, Event, Page, Showing, Snapshot, Status, Token, User,
-    UserId, conversation, live::Registration, page, status, wire,
+    Conversation, ConversationId, Directory, Draft, Event, Page, Showing, Snapshot, Status, TYPING,
+    Token, User, UserId, conversation,
+    live::{Registration, Subject},
+    mention, message, page, status, wire,
 };
 use crate::{
     network,
@@ -85,7 +87,7 @@ pub(super) struct Inner {
     /// Where the live channel is, read from the page that carries the token.
     registration: Mutex<Option<Registration>>,
     /// The people whose comings and goings the live channel is asked to report.
-    pub(super) watched: std::sync::Mutex<Vec<UserId>>,
+    pub(super) watched: std::sync::Mutex<Vec<Subject>>,
     /// Tells the live channel that `watched` changed.
     pub(super) watched_changed: Notify,
     /// Everyone who has been looked up. What an earlier launch kept is looked up once
@@ -251,20 +253,79 @@ impl Client {
         events
     }
 
-    /// Asks the live channel to report, from now on, whether these people are around, in
-    /// place of whoever it was asked about before. It reports each person's state at once
-    /// and then whenever it changes.
-    pub fn watch(&self, people: Vec<UserId>) {
+    /// Asks the live channel to report, from now on, whether these people are around and
+    /// who is typing in these conversations, in place of what it was asked about before. It
+    /// reports each person's state at once and then whenever it changes.
+    pub fn watch(&self, people: Vec<UserId>, typing_in: Vec<ConversationId>) {
+        let subjects: Vec<Subject> = people
+            .into_iter()
+            .map(Subject::Person)
+            .chain(typing_in.into_iter().map(Subject::Typing))
+            .collect();
         // A poisoned lock only means another thread panicked mid-swap; the list is whole.
         let mut watched = self
             .0
             .watched
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *watched != people {
-            *watched = people;
+        if *watched != subjects {
+            *watched = subjects;
             self.0.watched_changed.notify_one();
         }
+    }
+
+    /// Sends a message to `conversation`. `id` is made up by the caller with [`new_id`];
+    /// sending the same one again sends nothing more. Gives the message as Google kept it.
+    pub fn send(
+        &self,
+        conversation: &ConversationId,
+        draft: &Draft,
+        id: &str,
+    ) -> impl Future<Output = Result<super::Message, Error>> + use<> {
+        let request = wire::CreateTopicRequest {
+            text_body: draft.text.clone(),
+            annotations: draft
+                .mentions
+                .iter()
+                .map(|m| mention(&draft.text, m))
+                .collect(),
+            group_id: Some(group_id(conversation)),
+            topic_and_message_id: id.to_owned(),
+            history_v2: true,
+            message_info: Some(wire::MessageInfo {
+                accept_format_annotations: false,
+            }),
+            request_header: wire::request_header(),
+        };
+        self.spawn(move |inner| async move {
+            let response: wire::CreateTopicResponse = inner.call("create_topic", &request).await?;
+            response
+                .topic
+                .and_then(|topic| topic.replies.into_iter().next())
+                .and_then(message)
+                .ok_or(Error::Unreadable("the sent message"))
+        })
+    }
+
+    /// Says the signed-in person is typing in `conversation`. It wears off by itself.
+    pub fn typing(
+        &self,
+        conversation: &ConversationId,
+    ) -> impl Future<Output = Result<(), Error>> + use<> {
+        let request = wire::SetTypingStateRequest {
+            state: TYPING,
+            context: Some(wire::TypingContext {
+                group_id: Some(group_id(conversation)),
+                topic_id: None,
+            }),
+            request_header: wire::request_header(),
+        };
+        self.spawn(move |inner| async move {
+            inner
+                .call::<_, wire::SetTypingStateResponse>("set_typing_state", &request)
+                .await
+                .map(|_| ())
+        })
     }
 
     /// Runs `work` on the network threads.

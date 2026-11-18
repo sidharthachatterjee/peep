@@ -6,7 +6,7 @@ use gpui::{Entity, SharedString, TestAppContext, VisualTestContext};
 
 use super::*;
 use crate::chat::{
-    Availability, ConversationId, Event, Presence, Status as PersonStatus, UserId,
+    Availability, ConversationId, Draft, Event, Mention, Presence, Status as PersonStatus, UserId,
     fake::{Asked, Fake},
 };
 
@@ -202,11 +202,10 @@ fn the_people_on_screen_are_watched_until_the_window_closes(cx: &mut TestAppCont
     let presence =
         |cx: &mut VisualTestContext| account.read_with(cx, |account, _| account.rows()[0].presence);
 
-    assert!(
-        service
-            .asked()
-            .contains(&Asked::Watch(vec!["ada".into(), "grace".into()]))
-    );
+    assert!(service.asked().contains(&Asked::Watch(
+        vec!["ada".into(), "grace".into()],
+        vec!["dm/ada-dm".into(), "dm/grace-dm".into()]
+    )));
     assert_eq!(presence(cx), Some(Presence::Active), "asked at once");
 
     service.say(Event::Availability {
@@ -218,7 +217,10 @@ fn the_people_on_screen_are_watched_until_the_window_closes(cx: &mut TestAppCont
 
     cx.simulate_keystrokes("cmd-w");
     settle(cx);
-    assert_eq!(service.asked().last(), Some(&Asked::Watch(Vec::new())));
+    assert_eq!(
+        service.asked().last(),
+        Some(&Asked::Watch(Vec::new(), Vec::new()))
+    );
 }
 
 #[gpui::test]
@@ -332,4 +334,204 @@ fn a_read_on_another_device_clears_the_count_here(cx: &mut TestAppContext) {
     settle(cx);
 
     assert_eq!(list(&account, cx), [row("Ada", None), row("Grace", None)]);
+}
+
+/// What is in the box a message is written in, and why the last one was not sent.
+fn composer(cx: &mut VisualTestContext) -> (String, Option<String>) {
+    cx.update(|_, cx| {
+        let messages = main(cx).read(cx).messages.clone();
+        let composer = messages.read(cx).composer().clone();
+        composer.read(cx).state(cx)
+    })
+}
+
+fn typing(conversation: &str, person: &str, typing: bool) -> Event {
+    Event::Typing {
+        conversation: ConversationId::Dm(conversation.into()),
+        person: UserId(person.into()),
+        typing,
+    }
+}
+
+#[gpui::test]
+fn who_is_typing_shows_until_they_stop_send_or_go_quiet(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (account, cx) = start(&service, cx);
+    let shown = |cx: &mut VisualTestContext| {
+        account.read_with(cx, |account, _| {
+            let rows = account.rows();
+            let row = rows.iter().find(|row| row.title == "Ada").unwrap();
+            (row.typing, account.typing_in(&"dm/ada-dm".into()))
+        })
+    };
+    assert!(
+        service.asked().iter().any(|asked| matches!(
+            asked,
+            Asked::Watch(_, typing) if typing.contains(&"dm/ada-dm".to_owned())
+        )),
+        "Google is asked who types in the conversations on screen"
+    );
+
+    service.say(typing("ada-dm", "ada", true));
+    cx.run_until_parked();
+    assert_eq!(shown(cx), (true, vec!["Ada".into()]));
+
+    service.say(typing("ada-dm", "ada", false));
+    cx.run_until_parked();
+    assert_eq!(shown(cx), (false, Vec::new()), "she stopped");
+
+    service.say(typing("ada-dm", "ada", true));
+    service.say(typing("ada-dm", "me", true));
+    cx.run_until_parked();
+    assert_eq!(shown(cx).1.len(), 1, "my own typing elsewhere is not shown");
+    service.post("dm/ada-dm", "ada", "There.");
+    cx.run_until_parked();
+    assert_eq!(shown(cx), (false, Vec::new()), "what she typed arrived");
+
+    service.say(typing("ada-dm", "ada", true));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    service.say(typing("ada-dm", "ada", true));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(shown(cx).0, "Google said again that she is typing");
+    cx.executor().advance_clock(Duration::from_secs(3));
+    cx.run_until_parked();
+    assert_eq!(shown(cx), (false, Vec::new()), "nothing more was heard");
+}
+
+#[gpui::test]
+fn a_message_written_and_sent_shows_at_once_and_reaches_google(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (account, cx) = start(&service, cx);
+    // Down selects Grace below Ada; Enter opens her conversation to write in.
+    cx.simulate_keystrokes("tab down down enter");
+    settle(cx);
+    service.asked();
+
+    cx.simulate_input("Six, then.");
+    assert_eq!(
+        service.asked(),
+        [Asked::Typing("dm/grace-dm".into())],
+        "Google is told once, not for every letter"
+    );
+    assert_eq!(composer(cx).0, "Six, then.");
+
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert_eq!(
+        service.asked(),
+        [Asked::Send(
+            "dm/grace-dm".into(),
+            Draft {
+                text: "Six, then.".into(),
+                mentions: Vec::new()
+            }
+        )]
+    );
+    assert_eq!(messages(cx), ["Three", "Four", "Five", "Six, then."]);
+    assert_eq!(composer(cx), (String::new(), None));
+    assert_eq!(
+        list(&account, cx),
+        [row("Grace", None), row("Ada", None)],
+        "it moves to the top, and my own message is not unread"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("  ");
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert!(
+        !service
+            .asked()
+            .iter()
+            .any(|asked| matches!(asked, Asked::Send(..))),
+        "nothing is sent of nothing"
+    );
+}
+
+#[gpui::test]
+fn someone_named_with_an_at_is_mentioned(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (_, cx) = start(&service, cx);
+    cx.simulate_keystrokes("tab down enter");
+    settle(cx);
+
+    cx.simulate_input("thanks @a");
+    // Enter takes the person offered rather than sending.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(composer(cx).0, "thanks @Ada ");
+    cx.simulate_input("!");
+    service.asked();
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+
+    assert_eq!(
+        service.asked(),
+        [Asked::Send(
+            "dm/ada-dm".into(),
+            Draft {
+                text: "thanks @Ada !".into(),
+                mentions: vec![Mention {
+                    person: UserId("ada".into()),
+                    range: 7..11
+                }]
+            }
+        )]
+    );
+
+    // A name with a letter taken out is only text.
+    cx.simulate_input("@a");
+    cx.simulate_keystrokes("tab backspace backspace escape enter");
+    settle(cx);
+    assert_eq!(
+        service.asked().last(),
+        Some(&Asked::Send(
+            "dm/ada-dm".into(),
+            Draft {
+                text: "@Ad".into(),
+                mentions: Vec::new()
+            }
+        ))
+    );
+}
+
+#[gpui::test]
+fn a_message_google_refuses_goes_back_in_the_box(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (_, cx) = start(&service, cx);
+    cx.simulate_keystrokes("tab down enter");
+    settle(cx);
+    service.refuse_messages();
+
+    cx.simulate_input("Hello?");
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+
+    assert_eq!(messages(cx), ["Is the engine ready?", "Nearly."]);
+    let (text, error) = composer(cx);
+    assert_eq!(text, "Hello?");
+    assert!(error.is_some_and(|error| error.contains("403")));
+}
+
+#[gpui::test]
+fn what_is_being_written_is_kept_for_each_conversation(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (_, cx) = start(&service, cx);
+    let open = |id: &str, cx: &mut VisualTestContext| {
+        let id = id.to_owned();
+        cx.update(|_, cx| carry_out(Command::OpenConversation(id), cx));
+        settle(cx);
+    };
+
+    open("dm/ada-dm", cx);
+    cx.simulate_input("to Ada");
+    open("dm/grace-dm", cx);
+    assert_eq!(composer(cx).0, "");
+    cx.simulate_input("to Grace");
+    open("dm/ada-dm", cx);
+    assert_eq!(composer(cx).0, "to Ada");
+    open("dm/grace-dm", cx);
+    assert_eq!(composer(cx).0, "to Grace");
 }

@@ -190,6 +190,36 @@ pub enum MessageKind {
     Deleted,
 }
 
+/// A message as written, before it is sent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Draft {
+    pub text: String,
+    /// The people named in it, each where their name is in the text.
+    pub mentions: Vec<Mention>,
+}
+
+/// Someone named in a message, so that they are told about it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mention {
+    pub person: UserId,
+    /// Where their name is in the text, `@` included, in bytes.
+    pub range: std::ops::Range<usize>,
+}
+
+/// An id for a message about to be sent, made the way Google Chat's own client makes them:
+/// eleven characters that no other message will have.
+pub fn new_id() -> String {
+    use base64::Engine as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let mut hash = sha1_smol::Sha1::new();
+    hash.update(&crate::session::now().to_bits().to_le_bytes());
+    hash.update(&std::process::id().to_le_bytes());
+    hash.update(&MADE.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash.digest().bytes()[..8])
+}
+
 /// A run of a conversation's messages.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Page {
@@ -243,6 +273,14 @@ pub enum Event {
     Availability {
         person: UserId,
         availability: Availability,
+    },
+    /// Someone started typing in a conversation, or stopped. Google says they are typing
+    /// every few seconds for as long as they are, and often does not say they stopped. Only
+    /// conversations the channel was asked to [watch](Client::watch) are reported.
+    Typing {
+        conversation: ConversationId,
+        person: UserId,
+        typing: bool,
     },
     /// The conversations themselves changed: one was added, left, renamed, muted or hidden.
     ListChanged,
@@ -372,6 +410,7 @@ mod event {
     pub const MESSAGE_UPDATED: i32 = 7;
     pub const MESSAGE_DELETED: i32 = 8;
     pub const STATUS_UPDATED: i32 = 25;
+    pub const TYPING_CHANGED: i32 = 29;
     pub const AVAILABILITY_UPDATED: i32 = 45;
     pub const MARKED_UNREAD: i32 = 37;
     pub const READ_STATE_UPDATED: i32 = 83;
@@ -493,6 +532,17 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
                     availability: availability(changed.state)?,
                 })
             }),
+            event::TYPING_CHANGED => body.typing.and_then(|changed| {
+                let person = changed.user_id.filter(|id| !id.id.is_empty())?;
+                let context = changed.context?;
+                // Typing in a thread's own box is not typing in the conversation's.
+                let conversation = within(context.group_id.filter(|_| context.topic_id.is_none()))?;
+                Some(Event::Typing {
+                    conversation,
+                    person: UserId(person.id.into()),
+                    typing: changed.state == TYPING,
+                })
+            }),
             kind if event::LIST.contains(&kind) => Some(Event::ListChanged),
             _ => None,
         };
@@ -500,6 +550,32 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
 }
 
 const DO_NOT_DISTURB: i32 = 2;
+/// Google's number for someone typing, as opposed to having stopped.
+const TYPING: i32 = 1;
+/// Google's numbers for an annotation that mentions someone, and for a plain mention.
+const USER_MENTION: i32 = 6;
+const MENTION: i32 = 3;
+
+/// How `mention` goes to Google: where the name is, counted in UTF-16 code units.
+fn mention(text: &str, mention: &Mention) -> wire::Annotation {
+    let units = |bytes: &str| i32::try_from(bytes.encode_utf16().count()).unwrap_or(i32::MAX);
+    let person = wire::UserId {
+        id: mention.person.0.to_string(),
+    };
+    wire::Annotation {
+        kind: USER_MENTION,
+        start_index: units(&text[..mention.range.start]),
+        length: units(&text[mention.range.clone()]),
+        user_mention: Some(wire::UserMention {
+            id: Some(person.clone()),
+            kind: MENTION,
+            invitee_info: Some(wire::InviteeInfo {
+                user_id: Some(person),
+            }),
+        }),
+        ..Default::default()
+    }
+}
 /// Whether a person is around, from Google's number for it. `None` when Google does not
 /// say.
 fn availability(state: i32) -> Option<Availability> {
@@ -1250,6 +1326,78 @@ mod tests {
                 Event::Other(event::STATUS_UPDATED),
             ]
         );
+    }
+
+    #[test]
+    fn a_report_says_who_is_typing_in_a_conversation() {
+        let typing = |state: i32, in_thread: bool| wire::EventBody {
+            typing: Some(wire::TypingStateChanged {
+                state,
+                user_id: Some(wire::UserId { id: "ada".into() }),
+                context: Some(wire::TypingContext {
+                    group_id: Some(wire::GroupId {
+                        dm_id: Some(wire::DmId { dm_id: "d".into() }),
+                        space_id: None,
+                    }),
+                    topic_id: in_thread.then(wire::TopicId::default),
+                }),
+            }),
+            ..body(event::TYPING_CHANGED)
+        };
+        let report = wire::Event {
+            bodies: vec![typing(1, false), typing(2, false), typing(1, true)],
+            ..Default::default()
+        };
+        let heard = |typing| Event::Typing {
+            conversation: ConversationId::Dm("d".into()),
+            person: UserId("ada".into()),
+            typing,
+        };
+
+        assert_eq!(
+            events(report),
+            [
+                heard(true),
+                heard(false),
+                Event::Other(event::TYPING_CHANGED)
+            ],
+            "typing a reply in a thread is not typing in the conversation"
+        );
+    }
+
+    #[test]
+    fn a_mention_says_where_the_name_is_as_google_counts() {
+        let text = "😀 hi @Ada!";
+        let start = text.find('@').unwrap();
+        let mention = mention(
+            text,
+            &Mention {
+                person: UserId("ada".into()),
+                range: start..start + 4,
+            },
+        );
+
+        assert_eq!(
+            (mention.kind, mention.start_index, mention.length),
+            (6, 6, 4)
+        );
+        let named = mention.user_mention.unwrap();
+        assert_eq!(named.kind, 3);
+        assert_eq!(named.id.unwrap().id, "ada");
+        assert_eq!(named.invitee_info.unwrap().user_id.unwrap().id, "ada");
+    }
+
+    #[test]
+    fn new_message_ids_look_like_googles_and_differ() {
+        let ids: std::collections::HashSet<String> = (0..100).map(|_| new_id()).collect();
+        assert_eq!(ids.len(), 100);
+        let url_safe = |id: &String| {
+            id.len() == 11
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        };
+        assert!(ids.iter().all(url_safe));
     }
 
     #[test]

@@ -16,8 +16,8 @@ pub use self::timeline::{Change, Entry, Timeline};
 use crate::{
     cache,
     chat::{
-        self, Client, ConversationId, Directory, Event, Message, MessageKind, Page, Presence,
-        Service, Showing, Snapshot, Status as PersonStatus, UserId,
+        self, Client, ConversationId, Directory, Draft, Event, Message, MessageKind, Page,
+        Presence, Service, Showing, Snapshot, Status as PersonStatus, UserId,
     },
     photos,
     session::{self, Session, SignIn},
@@ -48,9 +48,18 @@ const SIGN_IN_POLL: Duration = Duration::from_millis(400);
 /// How many of the most recent conversations have their messages loaded ahead of being
 /// opened, so opening them shows messages at once.
 const LOADED_AHEAD: usize = 5;
+/// How long someone counts as typing after Google last said so. Google says so every few
+/// seconds while they type, and often does not say when they stop.
+const TYPING_LASTS: Duration = Duration::from_secs(8);
+/// How often Google is told the signed-in person is typing, while they are.
+const TYPING_EVERY: Duration = Duration::from_secs(5);
 /// What a message from the signed-in person is headed with.
 const YOU: &str = "You";
 const UNKNOWN_SENDER: &str = "Unknown";
+/// Who is typing, when their name is not known.
+const SOMEONE: &str = "Someone";
+/// What a message with no text is shown as, where only text fits.
+const ATTACHMENT: &str = "Sent an attachment";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -81,6 +90,37 @@ pub struct Row {
     pub presence: Option<Presence>,
     /// What that person says they are doing, or nothing.
     pub note: SharedString,
+    /// Whether someone is typing in it.
+    pub typing: bool,
+}
+
+/// Someone who can be named in a message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Person {
+    pub id: UserId,
+    pub name: SharedString,
+    /// Where their photo is, if they have one.
+    pub photo: Option<SharedString>,
+}
+
+/// A message from someone else arrived.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Incoming {
+    pub conversation: SharedString,
+    /// What the conversation is called.
+    pub title: SharedString,
+    pub sender: SharedString,
+    /// The message's id, and its text or what stands for it.
+    pub message: SharedString,
+    pub text: SharedString,
+}
+
+/// A message could not be sent. It has been taken back out of the conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendFailed {
+    pub conversation: SharedString,
+    pub draft: Draft,
+    pub error: SharedString,
 }
 
 /// The messages of a conversation changed.
@@ -106,8 +146,16 @@ pub struct Account {
     /// The rows the list shows, and the open conversation: their people are watched.
     rows_in_view: Range<usize>,
     open_conversation: Option<SharedString>,
-    /// The people the live channel reports on as they come and go.
+    /// The people the live channel reports on as they come and go, and the conversations it
+    /// reports typing in.
     watched: Vec<UserId>,
+    watched_typing: Vec<ConversationId>,
+    /// Who is typing, by conversation.
+    typing: HashMap<SharedString, Vec<UserId>>,
+    /// Each ends someone's typing unless Google says again that they are.
+    typing_ends: HashMap<(SharedString, UserId), Task<()>>,
+    /// When Google was last told the signed-in person is typing, by conversation.
+    typing_said: HashMap<SharedString, Instant>,
     /// Those of them it has reported on since it connected. What it says about someone
     /// is newer than what asking says.
     reported: HashSet<UserId>,
@@ -138,6 +186,8 @@ pub struct Account {
 }
 
 impl EventEmitter<TimelineChanged> for Account {}
+impl EventEmitter<Incoming> for Account {}
+impl EventEmitter<SendFailed> for Account {}
 
 impl Account {
     /// Shows what the last launch kept, and resumes its session if there is one.
@@ -145,7 +195,7 @@ impl Account {
         let kept = cache::folder()
             .map(|folder| cache::read(&folder))
             .unwrap_or_default();
-        let rows = rows(&kept.directory, &HashMap::new());
+        let rows = rows(&kept.directory, &HashMap::new(), &HashMap::new());
         let status = if rows.is_empty() {
             Status::Starting
         } else {
@@ -173,6 +223,10 @@ impl Account {
             rows_in_view: 0..0,
             open_conversation: None,
             watched: Vec::new(),
+            watched_typing: Vec::new(),
+            typing: HashMap::new(),
+            typing_ends: HashMap::new(),
+            typing_said: HashMap::new(),
             reported: HashSet::new(),
             reconnected: false,
             watch_task: None,
@@ -347,11 +401,23 @@ impl Account {
 
     fn watch(&mut self, cx: &mut Context<Self>) {
         let Some(client) = &self.client else { return };
-        let people = people_in_view(&self.rows, &self.rows_in_view, &self.open_conversation);
-        // The same people in another order need nothing done.
-        if people.len() == self.watched.len()
-            && people.iter().all(|person| self.watched.contains(person))
-        {
+        let in_view = rows_in_view(&self.rows, &self.rows_in_view, &self.open_conversation);
+        let people = people_of(&in_view);
+        let conversations: Vec<ConversationId> = in_view
+            .iter()
+            .filter_map(|row| {
+                let known = &self.directory.conversations;
+                Some(
+                    known
+                        .iter()
+                        .find(|known| known.id.has_key(&row.id))?
+                        .id
+                        .clone(),
+                )
+            })
+            .collect();
+        // The same ones in another order need nothing done.
+        if same(&people, &self.watched) && same(&conversations, &self.watched_typing) {
             return;
         }
         let new: Vec<UserId> = people
@@ -359,8 +425,9 @@ impl Account {
             .filter(|person| !self.watched.contains(person))
             .cloned()
             .collect();
-        client.watch(people.clone());
+        client.watch(people.clone(), conversations.clone());
         self.watched = people;
+        self.watched_typing = conversations;
         // The channel reports changes from now on; how they are doing now is asked.
         self.ask(new, cx);
     }
@@ -684,7 +751,7 @@ impl Account {
     fn loaded(&mut self, result: Result<Snapshot, chat::Error>, cx: &mut Context<Self>) {
         match result {
             Ok(snapshot) => {
-                self.rows = rows(&snapshot.directory, &self.statuses);
+                self.rows = rows(&snapshot.directory, &self.statuses, &self.typing);
                 self.set_showing(snapshot.directory.showing, cx);
                 self.directory = snapshot.directory.clone();
                 self.set_status(Status::Ready, cx);
@@ -776,7 +843,7 @@ impl Account {
                     && (known.unread > 0) != unread
                 {
                     known.unread = u32::from(unread);
-                    self.rows = rows(&self.directory, &self.statuses);
+                    self.rows = rows(&self.directory, &self.statuses, &self.typing);
                     cx.notify();
                 }
             }
@@ -807,6 +874,15 @@ impl Account {
                 self.reported.insert(person);
                 self.statuses_changed(cx);
             }
+            Event::Typing {
+                conversation,
+                person,
+                typing,
+            } => {
+                if self.directory.me.as_ref() != Some(&person) {
+                    self.set_typing(conversation.key().into(), person, typing, cx);
+                }
+            }
             Event::ListChanged => self.reload_soon(cx),
             Event::Other(_) => {}
         }
@@ -832,26 +908,188 @@ impl Account {
             }
             return;
         };
+        let key: SharedString = conversation.key().into();
         if posted {
             known.sort_time = known.sort_time.max(message.time);
-            if message.kind == MessageKind::Sent && me.as_ref() != Some(&message.sender) {
+            let from_someone_else =
+                message.kind == MessageKind::Sent && me.as_ref() != Some(&message.sender);
+            if from_someone_else {
                 known.unread = known.unread.saturating_add(1);
+                if !known.muted {
+                    let incoming = Incoming {
+                        conversation: key.clone(),
+                        title: SharedString::from(known.title.clone()),
+                        sender: sender_of(&self.directory, &message).0,
+                        message: SharedString::from(message.id.clone()),
+                        text: preview(&message),
+                    };
+                    cx.emit(incoming);
+                }
             }
+            // Whoever wrote it has stopped typing it.
+            self.set_typing(key.clone(), message.sender.clone(), false, cx);
             self.directory
                 .conversations
                 .sort_by_key(|conversation| std::cmp::Reverse(conversation.sort_time));
-            self.rows = rows(&self.directory, &self.statuses);
+            self.rows = rows(&self.directory, &self.statuses, &self.typing);
             // The same rows now hold other people.
             self.watch_soon(cx);
         }
 
-        let key: SharedString = conversation.key().into();
         let directory = &self.directory;
         let change = self
             .timelines
             .get_mut(&key)
             .and_then(|timeline| timeline.apply(message, posted, |m| sender_of(directory, m)));
         self.changed(&key, change, cx);
+    }
+
+    /// Notes that someone is typing in a conversation, or has stopped. Typing ends by
+    /// itself unless Google says again that it goes on.
+    fn set_typing(
+        &mut self,
+        conversation: SharedString,
+        person: UserId,
+        typing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let typists = self.typing.entry(conversation.clone()).or_default();
+        let was_typing = typists.contains(&person);
+        let ends = (conversation.clone(), person.clone());
+        if typing {
+            if !was_typing {
+                typists.push(person.clone());
+            }
+            let timer = cx.background_executor().timer(TYPING_LASTS);
+            let ended = ends.clone();
+            let end = cx.spawn(async move |this, cx| {
+                timer.await;
+                let (conversation, person) = ended;
+                this.update(cx, |this, cx| {
+                    this.set_typing(conversation, person, false, cx)
+                })
+                .ok();
+            });
+            self.typing_ends.insert(ends, end);
+        } else {
+            typists.retain(|typist| *typist != person);
+            self.typing_ends.remove(&ends);
+        }
+        if self.typing.get(&conversation).is_some_and(Vec::is_empty) {
+            self.typing.remove(&conversation);
+        }
+        if was_typing != typing {
+            if let Some(row) = self.rows.iter_mut().find(|row| row.id == conversation) {
+                row.typing = self.typing.contains_key(&conversation);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The names of those typing in a conversation, in the order they started.
+    pub fn typing_in(&self, conversation: &SharedString) -> Vec<SharedString> {
+        let typists = self.typing.get(conversation).into_iter().flatten();
+        typists
+            .map(|person| {
+                let name = self.directory.users.get(person).map(|user| &user.name);
+                name.filter(|name| !name.is_empty())
+                    .map_or(SOMEONE.into(), |name| SharedString::from(name.clone()))
+            })
+            .collect()
+    }
+
+    /// Tells Google the signed-in person is typing in a conversation. Called as they type,
+    /// it tells Google only every few seconds.
+    pub fn typing(&mut self, conversation: &SharedString, cx: &mut Context<Self>) {
+        let said = self.typing_said.get(conversation);
+        if said.is_some_and(|said| said.elapsed() < TYPING_EVERY) {
+            return;
+        }
+        let Some((client, id)) = self.reach(conversation) else {
+            return;
+        };
+        self.typing_said
+            .insert(conversation.clone(), Instant::now());
+        let said = client.typing(&id);
+        // Nothing is lost if this fails: the next keystroke after a while tries again.
+        cx.background_spawn(async move { drop(said.await) })
+            .detach();
+    }
+
+    /// The people who can be named in a message to a conversation: everyone in it but the
+    /// signed-in person.
+    pub fn people_in(&self, conversation: &SharedString) -> Vec<Person> {
+        let known = &self.directory.conversations;
+        let members = known
+            .iter()
+            .find(|known| known.id.has_key(conversation))
+            .map_or(&[][..], |known| known.members.as_slice());
+        members
+            .iter()
+            .filter_map(|id| {
+                let user = self.directory.users.get(id)?;
+                Some(Person {
+                    id: id.clone(),
+                    name: SharedString::from(user.name.clone()),
+                    photo: photo(&user.photo),
+                })
+            })
+            .filter(|person| !person.name.is_empty())
+            .collect()
+    }
+
+    /// Sends a message to a conversation. It shows there at once; if Google will not take
+    /// it, it is taken back out and [`SendFailed`] says why.
+    pub fn send(&mut self, conversation: &SharedString, draft: Draft, cx: &mut Context<Self>) {
+        let (Some((client, id)), Some(me)) = (self.reach(conversation), self.directory.me.clone())
+        else {
+            return;
+        };
+        if draft.text.trim().is_empty() {
+            return;
+        }
+        let message_id = chat::new_id();
+        let sending = client.send(&id, &draft, &message_id);
+        let shown = Message {
+            id: message_id.clone().into(),
+            sender: me,
+            sender_name: "".into(),
+            time: now(),
+            kind: MessageKind::Sent,
+            text: draft.text.clone().into(),
+            attachments: Vec::new(),
+            edited: false,
+        };
+        self.message_arrived(id.clone(), shown, true, cx);
+        // The next thing typed is a new message, said to be typed at once.
+        self.typing_said.remove(conversation);
+        let conversation = conversation.clone();
+        cx.spawn(async move |this, cx| {
+            let sent = sending.await;
+            this.update(cx, |this, cx| {
+                let kept = sent.as_ref().is_ok_and(|sent| *sent.id == *message_id);
+                if !kept {
+                    // Google kept it under another id, or not at all.
+                    let directory = &this.directory;
+                    let timeline = this.timelines.get_mut(&conversation);
+                    let change = timeline.and_then(|timeline| {
+                        timeline.remove(&message_id, |m| sender_of(directory, m))
+                    });
+                    this.changed(&conversation, change, cx);
+                }
+                match sent {
+                    Ok(sent) => this.message_arrived(id, sent, true, cx),
+                    Err(chat::Error::SignedOut) => this.signed_out(cx),
+                    Err(error) => cx.emit(SendFailed {
+                        conversation,
+                        draft,
+                        error: error.to_string().into(),
+                    }),
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Reloads the list once a burst of changes to it has passed.
@@ -875,6 +1113,10 @@ impl Account {
         self.timelines.clear();
         self.statuses.clear();
         self.watched.clear();
+        self.watched_typing.clear();
+        self.typing.clear();
+        self.typing_ends.clear();
+        self.typing_said.clear();
         self.reported.clear();
         self.watch_task = None;
         self.settings_task = None;
@@ -927,17 +1169,27 @@ fn sender_of(directory: &Directory, message: &Message) -> (SharedString, Option<
     (name, photo)
 }
 
+/// A message in a line or two, for a notification.
+fn preview(message: &Message) -> SharedString {
+    let text = message.text.trim();
+    match (text.is_empty(), message.attachments.first()) {
+        (false, _) => SharedString::from(text.to_owned()),
+        (true, Some(name)) => SharedString::from(name.clone()),
+        (true, None) => ATTACHMENT.into(),
+    }
+}
+
 fn photo(address: &str) -> Option<SharedString> {
     (!address.is_empty()).then(|| SharedString::from(address.to_owned()))
 }
 
-/// The people to watch: those in the rows the list shows and a little beyond, and the
-/// person the open conversation is with. A list showing no rows has no one beyond them.
-fn people_in_view(
-    rows: &[Row],
+/// The rows to watch the people and the typing of: those the list shows and a little
+/// beyond, and the open conversation first. A list showing no rows has none beyond them.
+fn rows_in_view<'a>(
+    rows: &'a [Row],
     in_view: &Range<usize>,
     open: &Option<SharedString>,
-) -> Vec<UserId> {
+) -> Vec<&'a Row> {
     let beyond = if in_view.is_empty() {
         0
     } else {
@@ -945,17 +1197,27 @@ fn people_in_view(
     };
     let start = in_view.start.saturating_sub(beyond).min(rows.len());
     let end = (in_view.end + beyond).min(rows.len());
-    let open = rows
-        .iter()
-        .find(|row| open.as_ref() == Some(&row.id))
-        .and_then(|row| row.person.clone());
+    let open = rows.iter().find(|row| open.as_ref() == Some(&row.id));
+    let mut watched: Vec<&Row> = Vec::new();
+    for row in open.into_iter().chain(&rows[start..end]) {
+        if watched.len() < MOST_WATCHED && !watched.iter().any(|seen| seen.id == row.id) {
+            watched.push(row);
+        }
+    }
+    watched
+}
+
+/// Whether two lists hold the same things, in any order.
+fn same<T: PartialEq>(one: &[T], other: &[T]) -> bool {
+    one.len() == other.len() && one.iter().all(|item| other.contains(item))
+}
+
+/// The people those rows are with, each once.
+fn people_of(rows: &[&Row]) -> Vec<UserId> {
     let mut people: Vec<UserId> = Vec::new();
-    for person in open
-        .into_iter()
-        .chain(rows[start..end].iter().filter_map(|row| row.person.clone()))
-    {
-        if people.len() < MOST_WATCHED && !people.contains(&person) {
-            people.push(person);
+    for person in rows.iter().filter_map(|row| row.person.as_ref()) {
+        if !people.contains(person) {
+            people.push(person.clone());
         }
     }
     people
@@ -973,7 +1235,11 @@ fn show_statuses(rows: &mut [Row], statuses: &HashMap<UserId, PersonStatus>) {
 }
 
 /// The conversation list as drawn, most recently active first.
-fn rows(directory: &Directory, statuses: &HashMap<UserId, PersonStatus>) -> Vec<Row> {
+fn rows(
+    directory: &Directory,
+    statuses: &HashMap<UserId, PersonStatus>,
+    typing: &HashMap<SharedString, Vec<UserId>>,
+) -> Vec<Row> {
     let mut rows: Vec<Row> = directory
         .conversations
         .iter()
@@ -982,8 +1248,10 @@ fn rows(directory: &Directory, statuses: &HashMap<UserId, PersonStatus>) -> Vec<
                 (ConversationId::Dm(_), [person]) => Some(person.clone()),
                 _ => None,
             };
+            let id = SharedString::from(conversation.id.key());
             Row {
-                id: conversation.id.key().into(),
+                typing: typing.contains_key(&id),
+                id,
                 title: SharedString::from(conversation.title.clone()),
                 unread: match conversation.unread {
                     0 => None,
@@ -1068,7 +1336,7 @@ mod tests {
         ]
         .into();
 
-        let rows = rows(&directory(), &statuses);
+        let rows = rows(&directory(), &statuses, &HashMap::new());
 
         let shown: Vec<_> = rows
             .iter()
@@ -1126,7 +1394,7 @@ mod tests {
         rows[42] = row("dm/again", Some("p40"));
         let watched = |in_view: Range<usize>, open: Option<&str>| {
             let open = open.map(|open| SharedString::from(open.to_owned()));
-            let people = people_in_view(&rows, &in_view, &open);
+            let people = people_of(&rows_in_view(&rows, &in_view, &open));
             people
                 .iter()
                 .map(|person| person.0.to_string())
@@ -1154,7 +1422,11 @@ mod tests {
         assert_eq!(with_open[..2], ["p150", "p0"]);
         assert_eq!(watched(0..2, Some("dm/1")).len(), 17, "already on screen");
 
-        assert_eq!(watched(0..200, None).len(), MOST_WATCHED);
+        assert_eq!(
+            watched(0..200, None).len(),
+            MOST_WATCHED - 2,
+            "the first hundred rows, whoever is in them"
+        );
         assert_eq!(watched(500..600, None), Vec::<String>::new());
         assert_eq!(watched(0..0, None), Vec::<String>::new(), "no list, no one");
     }
@@ -1225,7 +1497,7 @@ mod tests {
         let account = cx.new(|_| {
             let mut account = Account::with(Status::Ready, Vec::new());
             account.directory = directory();
-            account.rows = rows(&account.directory, &account.statuses);
+            account.rows = rows(&account.directory, &account.statuses, &account.typing);
             account
         });
         let shown = |row: usize, cx: &mut TestAppContext| {

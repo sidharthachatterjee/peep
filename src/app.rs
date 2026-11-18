@@ -1,5 +1,6 @@
 //! The application: its menu, its key bindings and its main window.
 
+mod composer;
 mod conversations;
 #[cfg(test)]
 mod end_to_end;
@@ -13,7 +14,10 @@ use gpui::{
     Window, actions, div, prelude::*,
 };
 
-use self::{conversations::Conversations, messages::Messages};
+use self::{
+    conversations::{Conversations, Opened},
+    messages::Messages,
+};
 use crate::{
     account::{Account, Status},
     chat::Showing,
@@ -179,6 +183,18 @@ fn carry_out(command: Command, cx: &mut App) {
             if let Some(main) = main {
                 let conversations = main.read(cx).conversations.clone();
                 conversations.update(cx, |conversations, cx| conversations.select_id(&id, cx));
+                // It was opened to be answered.
+                let messages = main.read(cx).messages.clone();
+                cx.defer(move |cx| {
+                    let Some(window) = cx.windows().first().copied() else {
+                        return;
+                    };
+                    window
+                        .update(cx, |_, window, cx| {
+                            messages.update(cx, |messages, cx| messages.write(window, cx));
+                        })
+                        .ok();
+                });
             }
         }
         Command::Quit => cx.quit(),
@@ -274,6 +290,11 @@ impl Main {
             let selected = conversations.read(cx).selected_id();
             this.messages
                 .update(cx, |messages, cx| messages.show(selected, window, cx));
+        })
+        .detach();
+        cx.subscribe_in(&conversations, window, |this, _, _: &Opened, window, cx| {
+            this.messages
+                .update(cx, |messages, cx| messages.write(window, cx));
         })
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {

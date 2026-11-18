@@ -1,13 +1,16 @@
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollStrategy, SharedString,
-    Subscription, UniformListScrollHandle, Window, div, prelude::*, uniform_list,
+    Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, ScrollStrategy,
+    SharedString, Subscription, UniformListScrollHandle, Window, div, prelude::*, uniform_list,
 };
 
 use crate::{
     account::Account,
     theme::ActiveTheme,
-    ui::{Avatar, Badge, Color, Label, ListItem, Next, Previous, focus_visible},
+    ui::{Avatar, Badge, Color, Confirm, Label, ListItem, Next, Previous, TextSize, focus_visible},
 };
+
+/// What a row says under its name while someone is typing there.
+const TYPING: &str = "typing…";
 
 /// The list of direct messages. It is one stop for Tab; Up and Down move the selection.
 pub struct Conversations {
@@ -20,6 +23,11 @@ pub struct Conversations {
     scroll: UniformListScrollHandle,
     _account_changed: Subscription,
 }
+
+/// A conversation was picked to write in: clicked, or Enter pressed on it.
+pub struct Opened;
+
+impl EventEmitter<Opened> for Conversations {}
 
 impl Conversations {
     pub fn new(account: Entity<Account>, cx: &mut Context<Self>) -> Self {
@@ -140,21 +148,32 @@ impl Render for Conversations {
                         ListItem::new(row.id.clone())
                             .selected(selected)
                             .focused(selected && show_focus)
-                            .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select(index, cx);
+                                cx.emit(Opened);
+                            }))
                             .child(
                                 Avatar::new(row.title.clone())
                                     .photo(row.photo.clone())
                                     .presence(row.presence),
                             )
-                            .child(div().flex_1().overflow_hidden().child(
-                                if row.unread.is_some() {
-                                    title.emphasized()
-                                } else if row.muted {
-                                    title.color(Color::Muted)
-                                } else {
-                                    title
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .child(if row.unread.is_some() {
+                                        title.emphasized()
+                                    } else if row.muted {
+                                        title.color(Color::Muted)
+                                    } else {
+                                        title
+                                    })
+                                    .children(row.typing.then(|| {
+                                        Label::new(TYPING)
+                                            .size(TextSize::Caption)
+                                            .color(Color::Accent)
+                                    })),
+                            )
                             .children(row.unread.clone().map(Badge::new))
                     })
                     .collect::<Vec<_>>()
@@ -167,6 +186,11 @@ impl Render for Conversations {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &Next, _, cx| this.step(true, cx)))
             .on_action(cx.listener(|this, _: &Previous, _, cx| this.step(false, cx)))
+            .on_action(cx.listener(|this, _: &Confirm, _, cx| {
+                if this.selected.is_some() {
+                    cx.emit(Opened);
+                }
+            }))
             .flex_none()
             .w(theme.size.sidebar)
             .h_full()

@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use futures::{FutureExt as _, channel::mpsc::UnboundedReceiver, future::BoxFuture};
 
-use super::{Client, ConversationId, Error, Event, Page, Showing, Snapshot, Status, UserId};
+use super::{
+    Client, ConversationId, Draft, Error, Event, Message, Page, Showing, Snapshot, Status, UserId,
+};
 
 /// What comes back from asking, once it has.
 pub type Answer<T> = BoxFuture<'static, Result<T, Error>>;
@@ -27,12 +29,19 @@ pub trait Service {
     /// Changes what the signed-in person shows others. Gives what was saved.
     fn show(&self, showing: Showing) -> Answer<Showing>;
 
+    /// Sends a message. `id` is from [`new_id`](super::new_id); sending the same one again
+    /// sends nothing more. Gives the message as it was kept.
+    fn send(&self, conversation: &ConversationId, draft: &Draft, id: &str) -> Answer<Message>;
+
+    /// Says the signed-in person is typing in `conversation`. It wears off by itself.
+    fn typing(&self, conversation: &ConversationId) -> Answer<()>;
+
     /// What happens from now on, as it happens, until the receiver is dropped.
     fn events(&self) -> UnboundedReceiver<Event>;
 
-    /// Asks for [`Event::Availability`] about these people from now on, in place of whoever
-    /// was asked about before.
-    fn watch(&self, people: Vec<UserId>);
+    /// Asks for [`Event::Availability`] about these people and [`Event::Typing`] in these
+    /// conversations from now on, in place of what was asked for before.
+    fn watch(&self, people: Vec<UserId>, typing_in: Vec<ConversationId>);
 }
 
 impl Service for Client {
@@ -56,11 +65,19 @@ impl Service for Client {
         Client::show(self, showing).boxed()
     }
 
+    fn send(&self, conversation: &ConversationId, draft: &Draft, id: &str) -> Answer<Message> {
+        Client::send(self, conversation, draft, id).boxed()
+    }
+
+    fn typing(&self, conversation: &ConversationId) -> Answer<()> {
+        Client::typing(self, conversation).boxed()
+    }
+
     fn events(&self) -> UnboundedReceiver<Event> {
         Client::events(self)
     }
 
-    fn watch(&self, people: Vec<UserId>) {
-        Client::watch(self, people);
+    fn watch(&self, people: Vec<UserId>, typing_in: Vec<ConversationId>) {
+        Client::watch(self, people, typing_in);
     }
 }

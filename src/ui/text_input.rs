@@ -332,6 +332,7 @@ impl TextInput {
     }
 
     /// Replaces all the text, as when a message has been sent, with the caret at its end.
+    /// Its owner did this, so it is not told of it.
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.text = text.into();
         self.selection = self.text.len()..self.text.len();
@@ -340,7 +341,9 @@ impl TextInput {
         self.accented.clear();
         self.undo.clear();
         self.redo.clear();
-        self.changed(cx);
+        self.column = None;
+        self.show_caret(cx);
+        cx.notify();
     }
 
     /// Replaces part of the text and puts the caret after what was put in.

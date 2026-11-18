@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use self::frames::{Frame, Payload, Reader};
 use super::{
-    Event, UserId,
+    ConversationId, Event, UserId,
     client::{Error, Inner, ORIGIN, network, refusal},
     events, wire,
 };
@@ -155,13 +155,32 @@ impl Registration {
     }
 }
 
-/// Starts watch `watch` on whether `person` is around.
-fn watch_person(watch: u64, person: &UserId) -> String {
-    let stream = json!([
-        ["user-state-changes"],
-        [1],
-        [[["state"], ["user"], [&*person.0], ["availability"]]]
-    ]);
+/// Something the channel reports on as it changes, when asked to watch it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Subject {
+    /// Whether a person is around.
+    Person(UserId),
+    /// Who is typing in a conversation.
+    Typing(ConversationId),
+}
+
+/// Starts watch `watch` on `subject`.
+fn watch_subject(watch: u64, subject: &Subject) -> String {
+    let stream = match subject {
+        Subject::Person(person) => json!([
+            ["user-state-changes"],
+            [1],
+            [[["state"], ["user"], [&*person.0], ["availability"]]]
+        ]),
+        Subject::Typing(conversation) => {
+            let (ConversationId::Dm(id) | ConversationId::Space(id)) = conversation;
+            json!([
+                ["group-state-changes"],
+                [1],
+                [[["state"], ["group"], [&**id], ["typing"]]]
+            ])
+        }
+    };
     let spec = json!([null, null, null, WATCH_VERSION, null, stream, null, null, 1]);
     json!([[[watch, spec]]]).to_string()
 }
@@ -277,43 +296,43 @@ fn updates(batch: &Value) -> Vec<Update> {
     updates
 }
 
-/// The watches one channel carries on people's availability.
-struct People {
-    /// The number of each person's watch.
-    watching: HashMap<UserId, u64>,
-    watched_by: HashMap<u64, UserId>,
-    /// People the server would not watch, who are not asked about again on this channel.
-    refused: HashSet<UserId>,
+/// The watches one channel carries besides the one on the signed-in person's events.
+struct Watches {
+    /// The number of each subject's watch.
+    watching: HashMap<Subject, u64>,
+    watched_by: HashMap<u64, Subject>,
+    /// What the server would not watch, which is not asked for again on this channel.
+    refused: HashSet<Subject>,
     next_watch: u64,
     /// The number of the last request sent, and how many messages have been sent in all.
     request: u32,
     sent: usize,
 }
 
-impl People {
+impl Watches {
     /// The messages that bring the channel's watches in line with `wanted`.
-    fn changes(&mut self, wanted: &[UserId]) -> Vec<String> {
+    fn changes(&mut self, wanted: &[Subject]) -> Vec<String> {
         let mut changes = Vec::new();
-        let gone: Vec<UserId> = self
+        let gone: Vec<Subject> = self
             .watching
             .keys()
-            .filter(|person| !wanted.contains(person))
+            .filter(|subject| !wanted.contains(subject))
             .cloned()
             .collect();
-        for person in gone {
-            if let Some(watch) = self.watching.remove(&person) {
+        for subject in gone {
+            if let Some(watch) = self.watching.remove(&subject) {
                 self.watched_by.remove(&watch);
                 changes.push(unwatch(watch));
             }
         }
-        for person in wanted {
-            if self.watching.contains_key(person) || self.refused.contains(person) {
+        for subject in wanted {
+            if self.watching.contains_key(subject) || self.refused.contains(subject) {
                 continue;
             }
             self.next_watch += 1;
-            self.watching.insert(person.clone(), self.next_watch);
-            self.watched_by.insert(self.next_watch, person.clone());
-            changes.push(watch_person(self.next_watch, person));
+            self.watching.insert(subject.clone(), self.next_watch);
+            self.watched_by.insert(self.next_watch, subject.clone());
+            changes.push(watch_subject(self.next_watch, subject));
         }
         changes
     }
@@ -453,7 +472,7 @@ impl Inner {
         let mut acknowledged = 0;
         let mut channel_id: Option<String> = None;
         let mut renew_credentials_at = Instant::now() + RENEW_CREDENTIALS;
-        let mut people = People {
+        let mut watches = Watches {
             watching: HashMap::new(),
             watched_by: HashMap::new(),
             refused: HashSet::new(),
@@ -461,8 +480,8 @@ impl Inner {
             request,
             sent: 1,
         };
-        // A new channel watches no one yet.
-        let mut people_changed = true;
+        // A new channel watches nothing else yet.
+        let mut watches_changed = true;
         loop {
             let poll = self
                 .live(
@@ -495,17 +514,17 @@ impl Inner {
             let mut reader = Reader::default();
             let mut heard_any = false;
             loop {
-                if std::mem::take(&mut people_changed) {
+                if std::mem::take(&mut watches_changed) {
                     let wanted = self
                         .watched
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    for messages in people.changes(&wanted).chunks(WATCHES_PER_REQUEST) {
-                        people.request += 1;
+                    for messages in watches.changes(&wanted).chunks(WATCHES_PER_REQUEST) {
+                        watches.request += 1;
                         let count = messages.len().to_string();
-                        let offset = people.sent.to_string();
-                        people.sent += messages.len();
+                        let offset = watches.sent.to_string();
+                        watches.sent += messages.len();
                         let mut form =
                             vec![("count".to_owned(), count), ("ofs".to_owned(), offset)];
                         for (index, message) in messages.iter().enumerate() {
@@ -520,7 +539,7 @@ impl Inner {
                                     &common[..],
                                     &[
                                         ("SID", &session),
-                                        ("RID", &people.request.to_string()),
+                                        ("RID", &watches.request.to_string()),
                                         ("AID", &acknowledged.to_string()),
                                         ("t", "1"),
                                     ],
@@ -539,7 +558,7 @@ impl Inner {
                         .map_err(|_| Error::Network("the live channel went quiet".into()))?
                         .map_err(network)?,
                     () = self.watched_changed.notified() => {
-                        people_changed = true;
+                        watches_changed = true;
                         continue;
                     }
                 };
@@ -596,14 +615,14 @@ impl Inner {
                             Update::Close => {
                                 return Err(Error::Network("the live channel closed".into()));
                             }
-                            // What a watch on a person reports is an event like any other.
+                            // What another watch reports is an event like any other.
                             Update::Change(_, change) => wire::Event::decode(change.as_slice())
                                 .map(events)
                                 .unwrap_or_default(),
                             Update::Refused(watch) => {
-                                if let Some(person) = people.watched_by.remove(&watch) {
-                                    people.watching.remove(&person);
-                                    people.refused.insert(person);
+                                if let Some(subject) = watches.watched_by.remove(&watch) {
+                                    watches.watching.remove(&subject);
+                                    watches.refused.insert(subject);
                                 }
                                 continue;
                             }
@@ -824,17 +843,21 @@ mod tests {
     }
 
     #[test]
-    fn watching_a_person_matches_what_the_web_client_sends() {
+    fn watching_matches_what_the_web_client_sends() {
         assert_eq!(
-            watch_person(2, &UserId("123".into())),
+            watch_subject(2, &Subject::Person(UserId("123".into()))),
             r#"[[[2,[null,null,null,[9,5],null,[["user-state-changes"],[1],[[["state"],["user"],["123"],["availability"]]]],null,null,1]]]]"#
+        );
+        assert_eq!(
+            watch_subject(27, &Subject::Typing(ConversationId::Dm("abc".into()))),
+            r#"[[[27,[null,null,null,[9,5],null,[["group-state-changes"],[1],[[["state"],["group"],["abc"],["typing"]]]],null,null,1]]]]"#
         );
         assert_eq!(unwatch(2), "[[[2,null,[]]]]");
     }
 
     #[test]
-    fn a_channels_watches_follow_who_is_wanted() {
-        let mut people = People {
+    fn a_channels_watches_follow_what_is_wanted() {
+        let mut watches = Watches {
             watching: HashMap::new(),
             watched_by: HashMap::new(),
             refused: HashSet::new(),
@@ -842,27 +865,28 @@ mod tests {
             request: 0,
             sent: 1,
         };
-        let person = |id: &str| UserId(id.into());
+        let person = |id: &str| Subject::Person(UserId(id.into()));
+        let typing = Subject::Typing(ConversationId::Dm("d".into()));
 
-        let changes = people.changes(&[person("a"), person("b")]);
+        let changes = watches.changes(&[person("a"), typing.clone()]);
         assert_eq!(
             changes,
-            [watch_person(2, &person("a")), watch_person(3, &person("b"))]
+            [watch_subject(2, &person("a")), watch_subject(3, &typing)]
         );
         assert_eq!(
-            people.changes(&[person("a"), person("b")]),
+            watches.changes(&[person("a"), typing.clone()]),
             [] as [String; 0]
         );
 
-        let changes = people.changes(&[person("b"), person("c")]);
-        assert_eq!(changes, [unwatch(2), watch_person(4, &person("c"))]);
-        assert_eq!(people.watched_by.get(&3), Some(&person("b")));
+        let changes = watches.changes(&[typing.clone(), person("c")]);
+        assert_eq!(changes, [unwatch(2), watch_subject(4, &person("c"))]);
+        assert_eq!(watches.watched_by.get(&3), Some(&typing));
 
-        people.refused.insert(person("d"));
+        watches.refused.insert(person("d"));
         assert_eq!(
-            people.changes(&[person("b"), person("c"), person("d")]),
+            watches.changes(&[typing, person("c"), person("d")]),
             [] as [String; 0],
-            "someone the server would not watch is not asked about again"
+            "what the server would not watch is not asked for again"
         );
     }
 }

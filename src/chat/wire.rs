@@ -428,6 +428,74 @@ pub struct TopicId {
     pub group_id: Option<GroupId>,
 }
 
+/// Sends a message at the top level of a conversation.
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateTopicRequest {
+    #[prost(string, tag = "2")]
+    pub text_body: String,
+    #[prost(message, repeated, tag = "3")]
+    pub annotations: Vec<Annotation>,
+    #[prost(message, optional, tag = "5")]
+    pub group_id: Option<GroupId>,
+    /// Made up by the sender. Sending the same one twice sends one message.
+    #[prost(string, tag = "7")]
+    pub topic_and_message_id: String,
+    /// The web client always sends true.
+    #[prost(bool, tag = "8")]
+    pub history_v2: bool,
+    #[prost(message, optional, tag = "9")]
+    pub message_info: Option<MessageInfo>,
+    #[prost(bytes = "vec", tag = "100")]
+    pub request_header: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageInfo {
+    #[prost(bool, tag = "1")]
+    pub accept_format_annotations: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateTopicResponse {
+    #[prost(message, optional, tag = "1")]
+    pub topic: Option<Topic>,
+}
+
+/// Where someone is typing: a conversation's own box, or a thread's.
+#[derive(Clone, PartialEq, Message)]
+pub struct TypingContext {
+    #[prost(message, optional, tag = "1")]
+    pub group_id: Option<GroupId>,
+    #[prost(message, optional, tag = "2")]
+    pub topic_id: Option<TopicId>,
+}
+
+/// Says the signed-in person is typing. Nothing says they stopped: it wears off.
+#[derive(Clone, PartialEq, Message)]
+pub struct SetTypingStateRequest {
+    /// 1 is typing.
+    #[prost(int32, tag = "1")]
+    pub state: i32,
+    #[prost(message, optional, tag = "2")]
+    pub context: Option<TypingContext>,
+    #[prost(bytes = "vec", tag = "100")]
+    pub request_header: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetTypingStateResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TypingStateChanged {
+    /// 1 is typing, 2 stopped.
+    #[prost(int32, tag = "1")]
+    pub state: i32,
+    #[prost(message, optional, tag = "2")]
+    pub user_id: Option<UserId>,
+    #[prost(message, optional, tag = "3")]
+    pub context: Option<TypingContext>,
+}
+
 /// Stands where a deleted message was.
 #[derive(Clone, PartialEq, Message)]
 pub struct Tombstone {
@@ -438,15 +506,39 @@ pub struct Tombstone {
 /// Something attached to a message or marked within its text.
 #[derive(Clone, PartialEq, Message)]
 pub struct Annotation {
-    /// 11 is a video call.
+    /// 6 is a mention of someone, 11 a video call.
     #[prost(int32, tag = "1")]
     pub kind: i32,
+    /// Where in the text it is, in UTF-16 code units.
+    #[prost(int32, tag = "2")]
+    pub start_index: i32,
+    #[prost(int32, tag = "3")]
+    pub length: i32,
     #[prost(message, optional, tag = "4")]
     pub drive: Option<DriveFile>,
+    #[prost(message, optional, tag = "5")]
+    pub user_mention: Option<UserMention>,
     #[prost(message, optional, tag = "7")]
     pub link: Option<Link>,
     #[prost(message, optional, tag = "10")]
     pub upload: Option<Upload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UserMention {
+    #[prost(message, optional, tag = "1")]
+    pub id: Option<UserId>,
+    /// 3 is a plain mention.
+    #[prost(int32, tag = "2")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "3")]
+    pub invitee_info: Option<InviteeInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InviteeInfo {
+    #[prost(message, optional, tag = "1")]
+    pub user_id: Option<UserId>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -514,6 +606,8 @@ pub struct EventBody {
     pub message_deleted: Option<MessageDeleted>,
     #[prost(message, optional, tag = "23")]
     pub user_status: Option<UserStatusUpdated>,
+    #[prost(message, optional, tag = "26")]
+    pub typing: Option<TypingStateChanged>,
     #[prost(message, optional, tag = "32")]
     pub marked_unread: Option<MarkedUnread>,
     #[prost(message, optional, tag = "38")]

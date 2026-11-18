@@ -1,8 +1,9 @@
 use gpui::{
-    App, Context, Entity, IntoElement, ListAlignment, ListScrollEvent, ListState, Render,
-    SharedString, Subscription, Window, div, list, prelude::*,
+    App, Context, Entity, Focusable as _, IntoElement, ListAlignment, ListScrollEvent, ListState,
+    Render, SharedString, Subscription, Window, div, list, prelude::*,
 };
 
+use super::composer::Composer;
 use crate::{
     account::{Account, Change, Entry, Row, TimelineChanged},
     chat::{MessageKind, Presence},
@@ -19,6 +20,7 @@ pub struct Messages {
     conversation: Option<SharedString>,
     /// One row per entry of the open conversation's timeline.
     list: ListState,
+    composer: Entity<Composer>,
     _subscriptions: [Subscription; 3],
 }
 
@@ -44,10 +46,21 @@ impl Messages {
                 }),
                 cx.observe_window_activation(window, |this, window, cx| this.attend(window, cx)),
             ],
+            composer: cx.new(|cx| Composer::new(account.clone(), cx)),
             account,
             conversation: None,
             list,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn composer(&self) -> &Entity<Composer> {
+        &self.composer
+    }
+
+    /// Puts keyboard focus where a message is written.
+    pub fn write(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.composer.focus_handle(cx), cx);
     }
 
     /// Shows a conversation, or none.
@@ -60,7 +73,9 @@ impl Messages {
         if self.conversation == conversation {
             return;
         }
-        self.conversation = conversation;
+        self.conversation = conversation.clone();
+        self.composer
+            .update(cx, |composer, cx| composer.show(conversation, cx));
         self.list.reset(self.entry_count(cx));
         self.attend(window, cx);
         cx.notify();
@@ -222,6 +237,7 @@ impl Render for Messages {
             .child(header)
             .child(Divider::horizontal())
             .child(div().flex_1().min_h_0().child(body))
+            .child(self.composer.clone())
             .into_any_element()
     }
 }

@@ -9,8 +9,8 @@ use futures::{
 };
 
 use super::{
-    Answer, Conversation, ConversationId, Directory, Error, Event, Message, MessageKind, Page,
-    Service, Showing, Snapshot, Status, User, UserId,
+    Answer, Conversation, ConversationId, Directory, Draft, Error, Event, Message, MessageKind,
+    Page, Service, Showing, Snapshot, Status, User, UserId,
 };
 
 /// How many messages a page holds.
@@ -24,7 +24,10 @@ pub(crate) enum Asked {
     MarkRead(String, i64),
     Statuses(Vec<String>),
     Show(Showing),
-    Watch(Vec<String>),
+    /// The people watched, then the conversations whose typing is.
+    Watch(Vec<String>, Vec<String>),
+    Send(String, Draft),
+    Typing(String),
 }
 
 /// The service and the handle a test keeps on it are the same thing, shared.
@@ -39,6 +42,8 @@ struct State {
     statuses: HashMap<UserId, Status>,
     /// Whether asking is refused, as when Google has signed the person out.
     signed_out: bool,
+    /// Whether messages are refused.
+    refusing_messages: bool,
     listeners: Vec<UnboundedSender<Event>>,
     asked: Vec<Asked>,
     /// When the newest things happen, if not now.
@@ -174,6 +179,11 @@ impl Fake {
         self.0.borrow_mut().signed_out = true;
     }
 
+    /// From now on messages are not taken.
+    pub(crate) fn refuse_messages(&self) {
+        self.0.borrow_mut().refusing_messages = true;
+    }
+
     /// What Peep has asked since this was last called, in order.
     pub(crate) fn asked(&self) -> Vec<Asked> {
         std::mem::take(&mut self.0.borrow_mut().asked)
@@ -276,8 +286,48 @@ impl Service for Fake {
         events
     }
 
-    fn watch(&self, people: Vec<UserId>) {
-        self.0.borrow_mut().asked.push(Asked::Watch(names(&people)));
+    fn send(&self, conversation: &ConversationId, draft: &Draft, id: &str) -> Answer<Message> {
+        let key = conversation.key();
+        if self.0.borrow().refusing_messages {
+            let asked = Asked::Send(key, draft.clone());
+            self.0.borrow_mut().asked.push(asked);
+            return future::ready(Err(Error::Refused(403))).boxed();
+        }
+        let mut sent = None;
+        let answer = self.answer(Asked::Send(key.clone(), draft.clone()), |state| {
+            let now = state.now.unwrap_or_else(now);
+            let kept = state.messages.entry(key).or_default();
+            // The same id sends the same message once.
+            match kept.iter().find(|message| &*message.id == id) {
+                Some(message) => message.clone(),
+                None => {
+                    let message = message(id, "me", &draft.text, now);
+                    kept.push(message.clone());
+                    sent = Some(message.clone());
+                    message
+                }
+            }
+        });
+        // Every device hears of it, this one too.
+        if let Some(message) = sent {
+            self.say(Event::Message {
+                conversation: conversation.clone(),
+                message,
+                posted: true,
+            });
+        }
+        answer
+    }
+
+    fn typing(&self, conversation: &ConversationId) -> Answer<()> {
+        self.answer(Asked::Typing(conversation.key()), |_| ())
+    }
+
+    fn watch(&self, people: Vec<UserId>, typing_in: Vec<ConversationId>) {
+        let mut conversations: Vec<String> = typing_in.iter().map(ConversationId::key).collect();
+        conversations.sort();
+        let asked = Asked::Watch(names(&people), conversations);
+        self.0.borrow_mut().asked.push(asked);
     }
 }
 

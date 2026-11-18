@@ -6,11 +6,11 @@
 
 use std::{path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
-use gpui::{AnyWindowHandle, HeadlessAppContext};
+use gpui::{AnyWindowHandle, HeadlessAppContext, Keystroke};
 
 use super::*;
 use crate::{
-    chat::{Availability, Status as PersonStatus, fake::Fake},
+    chat::{Availability, ConversationId, Event, Status as PersonStatus, UserId, fake::Fake},
     theme::{self, Mode},
 };
 
@@ -63,6 +63,27 @@ impl Drawn {
         self.update(|_, cx| carry_out(Command::OpenConversation(id.to_owned()), cx));
     }
 
+    /// Presses keys, as in `"tab enter"`, or types the letters of `text`.
+    fn press(&mut self, keys: &str) {
+        for key in keys.split(' ') {
+            self.key(key);
+        }
+    }
+
+    fn type_text(&mut self, text: &str) {
+        for letter in text.split("").filter(|letter| !letter.is_empty()) {
+            self.key(letter);
+        }
+    }
+
+    fn key(&mut self, key: &str) {
+        let os = self.cx.update(|cx| cx.platform_info().os);
+        let keystroke = Keystroke::parse_with_os(key, os).expect("a key that exists");
+        self.update(|window, cx| {
+            window.dispatch_keystroke(keystroke, cx);
+        });
+    }
+
     /// Lets everything Peep was waiting to do happen.
     fn settle(&mut self) {
         self.cx.run_until_parked();
@@ -74,6 +95,14 @@ impl Drawn {
     #[track_caller]
     fn looks_like(&mut self, name: &str) {
         self.settle();
+        // A caret that has moved shows, wherever it was in its blinking.
+        self.cx
+            .update_window(self.window, |_, window, cx| {
+                let end = Keystroke::parse("cmd-down").expect("a key that exists");
+                window.dispatch_keystroke(end, cx);
+            })
+            .expect("the window is open");
+        self.cx.run_until_parked();
         let drawn = self
             .cx
             .update_window(self.window, |_, window, cx| {
@@ -224,8 +253,33 @@ fn a_conversation_in_light_and_dark() {
         (Mode::Light, "conversation-light"),
         (Mode::Dark, "conversation-dark"),
     ] {
-        let mut drawn = Drawn::start(mode, Some(&people()));
+        let service = people();
+        let mut drawn = Drawn::start(mode, Some(&service));
         drawn.open("dm/ada lovelace-dm");
+        for (conversation, person) in [
+            ("ada lovelace", "ada lovelace"),
+            ("grace hopper", "grace hopper"),
+        ] {
+            service.say(Event::Typing {
+                conversation: ConversationId::Dm(format!("{conversation}-dm").into()),
+                person: UserId(person.into()),
+                typing: true,
+            });
+        }
         drawn.looks_like(name);
     }
+}
+
+#[test]
+fn writing_a_message_that_names_someone() {
+    let mut drawn = Drawn::start(Mode::Light, Some(&people()));
+    drawn.open("dm/ada lovelace-dm");
+    drawn.type_text("Ran the first set.");
+    drawn.press("shift-enter");
+    drawn.type_text("Thanks @a");
+    drawn.looks_like("naming");
+
+    drawn.press("enter");
+    drawn.type_text("for the warning about the ninth card, it did need punching again.");
+    drawn.looks_like("named");
 }
