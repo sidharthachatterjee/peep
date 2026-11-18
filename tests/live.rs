@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures::{channel::mpsc::TryRecvError, executor::block_on};
-use peep::chat::{Client, Event, Snapshot, UserId};
+use peep::chat::{Client, Event, Message, Snapshot, UserId};
 
 /// One client for every test: reading the session starts Chrome on Peep's profile, which
 /// only one Chrome can use at a time.
@@ -65,6 +65,21 @@ fn the_newest_conversation_has_messages_and_older_ones_before_them() {
         "{} messages, older ones: {}",
         page.messages.len(),
         page.older.is_some()
+    );
+    let with = |has: fn(&Message) -> bool| page.messages.iter().filter(|m| has(m)).count();
+    println!(
+        "with links or names {}, with reactions {}, quoting another {}",
+        with(|message| !message.marks.is_empty()),
+        with(|message| !message.reactions.is_empty()),
+        with(|message| message.quote.is_some())
+    );
+    let in_text = |message: &Message| {
+        let mut marks = message.marks.iter();
+        marks.all(|mark| message.text.get(mark.range.clone()).is_some())
+    };
+    assert!(
+        page.messages.iter().all(in_text),
+        "every mark is a part of its text"
     );
     assert!(!page.messages.is_empty());
     assert!(page.messages.is_sorted_by_key(|message| message.time));
