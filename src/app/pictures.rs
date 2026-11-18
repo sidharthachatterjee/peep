@@ -14,8 +14,8 @@ use crate::{
     theme::{self, Mode},
 };
 
-/// How far a colour channel may differ before a pixel counts as different: blending
-/// rounds a little differently between graphics cards.
+/// How far a colour channel may be from what is expected around it before a pixel counts
+/// as different: blending rounds a little differently between graphics cards.
 const CHANNEL_TOLERANCE: u8 = 8;
 /// Pixels per point, as on a Retina display.
 const SCALE: f32 = 2.;
@@ -104,22 +104,46 @@ impl Drawn {
             expected.dimensions(),
             "{name:?} changed size; compare {latest:?} with {kept:?}"
         );
-        let different = drawn
-            .pixels()
-            .zip(expected.pixels())
-            .filter(|(drawn, expected)| {
-                drawn
-                    .0
-                    .iter()
-                    .zip(expected.0)
-                    .any(|(drawn, expected)| drawn.abs_diff(expected) > CHANNEL_TOLERANCE)
-            })
-            .count();
+        let different = different_pixels(&drawn, &expected);
         assert!(
             different == 0,
             "{name:?} looks different in {different} pixels; compare {latest:?} with {kept:?}"
         );
     }
+}
+
+/// How many pixels of `drawn` are not what `expected` has there. The edges of letters come
+/// out a shade lighter or darker from one Mac to the next, so a pixel may be anything
+/// between its expected neighbours; a letter that changed or moved still shows.
+fn different_pixels(drawn: &image::RgbaImage, expected: &image::RgbaImage) -> usize {
+    let (width, height) = expected.dimensions();
+    let near = |drawn: u8, low: u8, high: u8| {
+        (low.saturating_sub(CHANNEL_TOLERANCE)..=high.saturating_add(CHANNEL_TOLERANCE))
+            .contains(&drawn)
+    };
+    drawn
+        .enumerate_pixels()
+        .filter(|(x, y, drawn)| {
+            let around = |channel: usize| {
+                let xs = x.saturating_sub(1)..=(x + 1).min(width - 1);
+                let ys = y.saturating_sub(1)..=(y + 1).min(height - 1);
+                let values = ys.flat_map(|y| xs.clone().map(move |x| (x, y)));
+                values.fold((u8::MAX, u8::MIN), |(low, high), (x, y)| {
+                    let value = expected.get_pixel(x, y).0[channel];
+                    (low.min(value), high.max(value))
+                })
+            };
+            let there = expected.get_pixel(*x, *y).0;
+            (0..4).any(|channel| {
+                let value = drawn.0[channel];
+                // Most pixels are simply the same, which is quick to see.
+                !near(value, there[channel], there[channel]) && {
+                    let (low, high) = around(channel);
+                    !near(value, low, high)
+                }
+            })
+        })
+        .count()
 }
 
 /// A set afternoon on the Mac's wall clock, in microseconds since the Unix epoch, so the
