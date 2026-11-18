@@ -105,7 +105,14 @@ impl RenderOnce for MessageRow {
                 .py(theme.spacing.sm)
                 .child(caption(day).emphasized())
         });
-        let column = div().flex().flex_col().px(theme.spacing.lg).children(day);
+        // The row fills its list, so the day's heading centres over the conversation rather
+        // than over this message.
+        let column = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .px(theme.spacing.lg)
+            .children(day);
 
         if let Kind::Notice = self.kind {
             return column.child(
