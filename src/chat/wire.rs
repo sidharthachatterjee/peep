@@ -90,6 +90,65 @@ pub struct GetSelfUserStatusResponse {
 pub struct UserStatus {
     #[prost(message, optional, tag = "1")]
     pub user_id: Option<UserId>,
+    #[prost(message, optional, tag = "2")]
+    pub dnd_settings: Option<DndSettings>,
+    #[prost(message, optional, tag = "6")]
+    pub custom_status: Option<CustomStatus>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DndSettings {
+    /// 2 is do not disturb.
+    #[prost(int32, tag = "1")]
+    pub dnd_state: i32,
+}
+
+/// What a person says they are doing, such as "In a meeting".
+#[derive(Clone, PartialEq, Message)]
+pub struct CustomStatus {
+    #[prost(string, tag = "1")]
+    pub status_text: String,
+    /// When it stops applying, or 0 for no end.
+    #[prost(int64, tag = "3")]
+    pub state_expiry_timestamp_usec: i64,
+    #[prost(message, optional, tag = "4")]
+    pub emoji: Option<Emoji>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Emoji {
+    #[prost(string, tag = "1")]
+    pub unicode: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetUserPresenceRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub user_ids: Vec<UserId>,
+    #[prost(bool, tag = "3")]
+    pub include_user_status: bool,
+    #[prost(bytes = "vec", tag = "100")]
+    pub request_header: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetUserPresenceResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub user_presences: Vec<UserPresence>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UserPresence {
+    #[prost(message, optional, tag = "1")]
+    pub user_id: Option<UserId>,
+    /// 1 is active, 3 idle. Anything else is away.
+    #[prost(int32, tag = "2")]
+    pub presence: i32,
+    /// 2 is do not disturb.
+    #[prost(int32, tag = "3")]
+    pub dnd_state: i32,
+    #[prost(message, optional, tag = "5")]
+    pub user_status: Option<UserStatus>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -421,10 +480,30 @@ pub struct EventBody {
     pub kind: i32,
     #[prost(message, optional, tag = "18")]
     pub message_deleted: Option<MessageDeleted>,
+    #[prost(message, optional, tag = "23")]
+    pub user_status: Option<UserStatusUpdated>,
     #[prost(message, optional, tag = "32")]
     pub marked_unread: Option<MarkedUnread>,
+    #[prost(message, optional, tag = "38")]
+    pub availability: Option<Availability>,
     #[prost(message, optional, tag = "65")]
     pub read_state: Option<ReadStateUpdated>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UserStatusUpdated {
+    #[prost(message, optional, tag = "1")]
+    pub user_status: Option<UserStatus>,
+}
+
+/// Whether a person is around changed.
+#[derive(Clone, PartialEq, Message)]
+pub struct Availability {
+    #[prost(message, optional, tag = "1")]
+    pub user_id: Option<UserId>,
+    /// 1 is active, 2 away, 3 idle.
+    #[prost(int32, tag = "3")]
+    pub state: i32,
 }
 
 /// A message posted or edited.

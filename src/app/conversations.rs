@@ -14,6 +14,8 @@ pub struct Conversations {
     account: Entity<Account>,
     /// The id of the selected conversation, so the selection survives the list reordering.
     selected: Option<SharedString>,
+    /// The rows last drawn and the selection then, as last told to the account.
+    shown: (std::ops::Range<usize>, Option<SharedString>),
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     _account_changed: Subscription,
@@ -37,6 +39,7 @@ impl Conversations {
             }),
             account,
             selected: None,
+            shown: (0..0, None),
             focus_handle: cx.focus_handle().tab_index(0).tab_stop(true),
             scroll: UniformListScrollHandle::new(),
         }
@@ -101,6 +104,16 @@ impl Render for Conversations {
             "conversations",
             count,
             cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                // The account watches the people on screen. It is told once this frame is
+                // drawn: it cannot change while it is being read.
+                let shown = (range.clone(), this.selected.clone());
+                if this.shown != shown {
+                    this.shown = shown.clone();
+                    let account = this.account.clone();
+                    cx.defer(move |cx| {
+                        account.update(cx, |account, cx| account.show_rows(shown.0, shown.1, cx));
+                    });
+                }
                 let rows = this.account.read(cx).rows();
                 let start = range.start;
                 rows.get(range)
@@ -115,7 +128,11 @@ impl Render for Conversations {
                             .selected(selected)
                             .focused(selected && show_focus)
                             .on_click(cx.listener(move |this, _, _, cx| this.select(index, cx)))
-                            .child(Avatar::new(row.title.clone()))
+                            .child(
+                                Avatar::new(row.title.clone())
+                                    .photo(row.photo.clone())
+                                    .presence(row.presence),
+                            )
                             .child(div().flex_1().overflow_hidden().child(
                                 if row.unread.is_some() {
                                     title.emphasized()
@@ -160,8 +177,7 @@ mod tests {
         Row {
             id: id.to_owned().into(),
             title: format!("Person {id}").into(),
-            unread: None,
-            muted: false,
+            ..Default::default()
         }
     }
 

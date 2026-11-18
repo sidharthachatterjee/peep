@@ -12,6 +12,7 @@ use crate::theme::ActiveTheme;
 #[derive(IntoElement)]
 pub struct MessageRow {
     sender: SharedString,
+    photo: Option<SharedString>,
     time: SharedString,
     text: SharedString,
     attachments: Vec<SharedString>,
@@ -32,6 +33,7 @@ impl MessageRow {
     pub fn new(sender: impl Into<SharedString>, time: impl Into<SharedString>) -> Self {
         Self {
             sender: sender.into(),
+            photo: None,
             time: time.into(),
             text: SharedString::default(),
             attachments: Vec::new(),
@@ -48,6 +50,12 @@ impl MessageRow {
             kind: Kind::Notice,
             ..Self::new("", "").text(text)
         }
+    }
+
+    /// Where the sender's photo is, as Google gives it.
+    pub fn photo(mut self, photo: Option<SharedString>) -> Self {
+        self.photo = photo;
+        self
     }
 
     pub fn text(mut self, text: impl Into<SharedString>) -> Self {
@@ -112,7 +120,9 @@ impl RenderOnce for MessageRow {
         let gutter = if self.continues {
             div().flex_none().w(theme.size.avatar_md).into_any_element()
         } else {
-            Avatar::new(self.sender.clone()).into_any_element()
+            Avatar::new(self.sender.clone())
+                .photo(self.photo)
+                .into_any_element()
         };
         let heading = (!self.continues).then(|| {
             div()

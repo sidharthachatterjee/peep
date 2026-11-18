@@ -15,11 +15,16 @@ const RUN_WINDOW: i64 = 5 * 60 * 1_000_000;
 /// asked for again.
 const FRESH_FOR: Duration = Duration::from_secs(5);
 
+/// Who a message is shown as being from: their name, and where their photo is.
+pub(super) type Sender = (SharedString, Option<SharedString>);
+
 /// One message, ready to draw.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub id: SharedString,
     pub sender: SharedString,
+    /// Where the sender's photo is, if they have one.
+    pub photo: Option<SharedString>,
     /// The time of day it was sent.
     pub time: SharedString,
     pub kind: MessageKind,
@@ -111,7 +116,7 @@ impl Timeline {
     pub(super) fn merge_newest(
         &mut self,
         page: Page,
-        name: impl Fn(&Message) -> SharedString,
+        who: impl Fn(&Message) -> Sender,
     ) -> Option<Change> {
         self.loading = false;
         self.failed = None;
@@ -162,7 +167,7 @@ impl Timeline {
             Change::Replaced
         };
         self.messages = messages;
-        self.rebuild(name);
+        self.rebuild(who);
         Some(change)
     }
 
@@ -170,7 +175,7 @@ impl Timeline {
     pub(super) fn merge_older(
         &mut self,
         page: Page,
-        name: impl Fn(&Message) -> SharedString,
+        who: impl Fn(&Message) -> Sender,
     ) -> Option<Change> {
         self.loading_older = false;
         self.older = page.older;
@@ -190,7 +195,7 @@ impl Timeline {
         let added = older.len();
         older.append(&mut self.messages);
         self.messages = older;
-        self.rebuild(name);
+        self.rebuild(who);
         Some(Change::Prepended(added))
     }
 
@@ -201,7 +206,7 @@ impl Timeline {
         &mut self,
         message: Message,
         posted: bool,
-        name: impl Fn(&Message) -> SharedString,
+        who: impl Fn(&Message) -> Sender,
     ) -> Option<Change> {
         if !self.is_loaded() {
             return None;
@@ -234,23 +239,19 @@ impl Timeline {
                 }
             }
         };
-        self.rebuild(name);
+        self.rebuild(who);
         Some(change)
     }
 
     /// Drops a message that was deleted.
-    pub(super) fn remove(
-        &mut self,
-        id: &str,
-        name: impl Fn(&Message) -> SharedString,
-    ) -> Option<Change> {
+    pub(super) fn remove(&mut self, id: &str, who: impl Fn(&Message) -> Sender) -> Option<Change> {
         let index = self.messages.iter().position(|known| &*known.id == id)?;
         self.messages.remove(index);
-        self.rebuild(name);
+        self.rebuild(who);
         Some(Change::Removed(index))
     }
 
-    fn rebuild(&mut self, name: impl Fn(&Message) -> SharedString) {
+    fn rebuild(&mut self, who: impl Fn(&Message) -> Sender) {
         let today = Local::now();
         let mut previous: Option<(&Message, Local)> = None;
         self.entries = self
@@ -266,9 +267,11 @@ impl Timeline {
                             || message.time - before.time > RUN_WINDOW
                     });
                 previous = Some((message, local));
+                let (sender, photo) = who(message);
                 Entry {
                     id: SharedString::from(message.id.clone()),
-                    sender: name(message),
+                    sender,
+                    photo,
                     time: local.clock().into(),
                     kind: message.kind,
                     text: SharedString::from(message.text.clone()),
@@ -312,8 +315,8 @@ mod tests {
         Page { messages, older }
     }
 
-    fn name(message: &Message) -> SharedString {
-        SharedString::from(message.sender.0.clone())
+    fn name(message: &Message) -> Sender {
+        (SharedString::from(message.sender.0.clone()), None)
     }
 
     fn ids(timeline: &Timeline) -> Vec<&str> {

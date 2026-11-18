@@ -1,24 +1,25 @@
 //! Requests to Google Chat with the signed-in session. All network work runs on Peep's own
 //! threads, never on the one that draws.
 
-use std::{
-    collections::HashMap,
-    future::Future,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use base64::Engine;
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use prost::Message;
 use reqwest::{Url, header};
-use tokio::{runtime::Runtime, sync::Mutex};
+use tokio::{
+    runtime::Runtime,
+    sync::{Mutex, Notify},
+};
 
 use super::{
-    Conversation, ConversationId, Directory, Event, Page, Snapshot, Token, User, UserId,
-    conversation, live::Registration, page, wire,
+    Conversation, ConversationId, Directory, Event, Page, Snapshot, Status, Token, User, UserId,
+    conversation, live::Registration, page, status, wire,
 };
-use crate::session::{self, Session};
+use crate::{
+    network,
+    session::{self, Session},
+};
 
 pub(super) const ORIGIN: &str = "https://chat.google.com";
 const API_PATH: &str = "/api/";
@@ -36,6 +37,13 @@ const REPLIES_PER_TOPIC: i32 = 20;
 /// Asks for what the web client asks for: each topic's read state, and read receipts.
 const TOPIC_METADATA: i32 = 4;
 const READ_RECEIPTS: i32 = 3;
+/// People looked up per request. Several small requests at once answer sooner than one
+/// large one.
+const PEOPLE_PER_REQUEST: usize = 100;
+/// People whose status is asked for per request. Google answers a larger request in the
+/// same time by leaving people out: asked about 500 at once, it reported a fifth of those
+/// who were active.
+const STATUSES_PER_REQUEST: usize = 50;
 /// A guard against a server that never stops paging.
 const MAX_PAGES: usize = 50;
 /// How long a request token is used before a fresh one is fetched, in seconds. Google
@@ -76,26 +84,21 @@ pub(super) struct Inner {
     token: Mutex<Option<Token>>,
     /// Where the live channel is, read from the page that carries the token.
     registration: Mutex<Option<Registration>>,
-    /// Everyone whose name has been looked up, so no one is looked up twice.
+    /// The people whose comings and goings the live channel is asked to report.
+    pub(super) watched: std::sync::Mutex<Vec<UserId>>,
+    /// Tells the live channel that `watched` changed.
+    pub(super) watched_changed: Notify,
+    /// Everyone who has been looked up. What an earlier launch kept is looked up once
+    /// more, since names and photos change; after that no one is looked up twice.
     users: Mutex<HashMap<UserId, User>>,
+    /// Whether what an earlier launch kept has been looked up again.
+    users_current: Mutex<bool>,
 }
 
 impl Client {
     /// A client for `session`, starting from what an earlier launch kept.
     pub fn new(session: Session, snapshot: Snapshot) -> Result<Self, Error> {
-        static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-        let runtime = match RUNTIME.get() {
-            Some(runtime) => runtime,
-            None => {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .thread_name("peep-network")
-                    .enable_all()
-                    .build()
-                    .map_err(|error| Error::Network(error.to_string()))?;
-                RUNTIME.get_or_init(|| runtime)
-            }
-        };
+        let runtime = network::runtime().map_err(|error| Error::Network(error.to_string()))?;
         let builder = || {
             reqwest::Client::builder()
                 .user_agent(session.user_agent())
@@ -115,13 +118,16 @@ impl Client {
             session,
             token: Mutex::new(snapshot.token),
             registration: Mutex::new(None),
+            watched: std::sync::Mutex::new(Vec::new()),
+            watched_changed: Notify::new(),
             users: Mutex::new(snapshot.directory.users),
+            users_current: Mutex::new(false),
         })))
     }
 
     /// Loads the direct messages and the people in them afresh, with what to keep for the
     /// next launch.
-    pub fn refresh(&self) -> impl Future<Output = Result<Snapshot, Error>> + 'static {
+    pub fn refresh(&self) -> impl Future<Output = Result<Snapshot, Error>> + use<> {
         self.spawn(move |inner| async move { inner.refresh().await })
     }
 
@@ -131,7 +137,7 @@ impl Client {
         &self,
         conversation: &ConversationId,
         before: Option<i64>,
-    ) -> impl Future<Output = Result<Page, Error>> + 'static {
+    ) -> impl Future<Output = Result<Page, Error>> + use<> {
         let request = wire::ListTopicsRequest {
             page_size_for_topics: MESSAGES_PER_PAGE,
             filter: before.map(|before| wire::ListTopicsFilter {
@@ -159,7 +165,7 @@ impl Client {
         &self,
         conversation: &ConversationId,
         time: i64,
-    ) -> impl Future<Output = Result<(), Error>> + 'static {
+    ) -> impl Future<Output = Result<(), Error>> + use<> {
         let request = wire::MarkGroupReadstateRequest {
             id: Some(group_id(conversation)),
             last_read_time: time,
@@ -173,6 +179,42 @@ impl Client {
         })
     }
 
+    /// How these people are doing right now. People Google says nothing about are left out.
+    pub fn statuses(
+        &self,
+        people: &[UserId],
+    ) -> impl Future<Output = Result<HashMap<UserId, Status>, Error>> + use<> {
+        let requests: Vec<wire::GetUserPresenceRequest> = people
+            .chunks(STATUSES_PER_REQUEST)
+            .map(|people| wire::GetUserPresenceRequest {
+                user_ids: people
+                    .iter()
+                    .map(|id| wire::UserId {
+                        id: id.0.to_string(),
+                    })
+                    .collect(),
+                include_user_status: true,
+                request_header: wire::request_header(),
+            })
+            .collect();
+        self.spawn(move |inner| async move {
+            let mut statuses = HashMap::new();
+            // One after another: asked for all at once, Google leaves some people out.
+            for request in requests {
+                let response: wire::GetUserPresenceResponse =
+                    inner.call("get_user_presence", &request).await?;
+                let now = (session::now() * 1_000_000.) as i64;
+                statuses.extend(
+                    response
+                        .user_presences
+                        .into_iter()
+                        .filter_map(|presence| status(presence, now)),
+                );
+            }
+            Ok(statuses)
+        })
+    }
+
     /// What happens from now on, as it happens. The channel behind it reconnects by itself
     /// and stops when the receiver is dropped.
     pub fn events(&self) -> UnboundedReceiver<Event> {
@@ -181,14 +223,31 @@ impl Client {
         events
     }
 
+    /// Asks the live channel to report, from now on, whether these people are around, in
+    /// place of whoever it was asked about before. It reports each person's state at once
+    /// and then whenever it changes.
+    pub fn watch(&self, people: Vec<UserId>) {
+        // A poisoned lock only means another thread panicked mid-swap; the list is whole.
+        let mut watched = self
+            .0
+            .watched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *watched != people {
+            *watched = people;
+            self.0.watched_changed.notify_one();
+        }
+    }
+
     /// Runs `work` on the network threads.
-    fn spawn<T, Work>(
+    fn spawn<T, Work, Start>(
         &self,
-        work: impl FnOnce(Arc<Inner>) -> Work,
-    ) -> impl Future<Output = Result<T, Error>> + 'static
+        work: Start,
+    ) -> impl Future<Output = Result<T, Error>> + use<T, Work, Start>
     where
         T: Send + 'static,
         Work: Future<Output = Result<T, Error>> + Send + 'static,
+        Start: FnOnce(Arc<Inner>) -> Work,
     {
         let task = self.0.runtime.spawn(work(self.0.clone()));
         async move { task.await.unwrap_or(Err(Error::Interrupted)) }
@@ -232,16 +291,20 @@ impl Inner {
             .iter()
             .flat_map(|conversation| &conversation.members)
             .collect();
+        // The signed-in person too, for the photo beside their own messages.
+        members.push(&me);
         members.sort_by(|a, b| a.0.cmp(&b.0));
         members.dedup();
 
         let mut users = self.users.lock().await;
+        let mut current = self.users_current.lock().await;
         let unknown: Vec<&UserId> = members
             .iter()
             .copied()
-            .filter(|id| !users.contains_key(id))
+            .filter(|id| !*current || !users.contains_key(id))
             .collect();
         users.extend(self.users(&unknown).await?);
+        *current = true;
         users.retain(|id, _| {
             members
                 .binary_search_by(|member| member.0.cmp(&id.0))
@@ -308,9 +371,17 @@ impl Inner {
     }
 
     async fn users(&self, ids: &[&UserId]) -> Result<HashMap<UserId, User>, Error> {
-        if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
+        let looked_up = ids
+            .chunks(PEOPLE_PER_REQUEST)
+            .map(|ids| self.some_users(ids));
+        Ok(futures::future::try_join_all(looked_up)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    async fn some_users(&self, ids: &[&UserId]) -> Result<HashMap<UserId, User>, Error> {
         let request = wire::GetMembersRequest {
             membership_ids: ids
                 .iter()
@@ -340,6 +411,7 @@ impl Inner {
                 let user = User {
                     name: user.name.into(),
                     email: user.email.into(),
+                    photo: user.avatar_url.into(),
                 };
                 Some((id, user))
             })

@@ -79,6 +79,12 @@ pub struct Sizes {
     pub avatar_md: Pixels,
     pub avatar_lg: Pixels,
     pub badge: Pixels,
+    /// The dot on an avatar that says whether the person is around, for each avatar size.
+    pub status_sm: Pixels,
+    pub status_md: Pixels,
+    pub status_lg: Pixels,
+    /// The gap kept clear around that dot.
+    pub status_ring: Pixels,
     /// The strip at the top of a window that holds the window buttons and drags the window.
     pub titlebar: Pixels,
     /// Where the window buttons sit inside that strip.
@@ -182,6 +188,10 @@ impl Sizes {
             avatar_md: px(32.),
             avatar_lg: px(40.),
             badge: px(18.),
+            status_sm: px(8.),
+            status_md: px(10.),
+            status_lg: px(12.),
+            status_ring: px(2.),
             titlebar: px(38.),
             window_buttons: point(px(13.), px(12.)),
             sidebar: px(280.),

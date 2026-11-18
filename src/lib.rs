@@ -4,6 +4,8 @@ pub mod account;
 pub mod app;
 pub mod cache;
 pub mod chat;
+mod network;
+pub mod photos;
 pub mod session;
 pub mod theme;
 pub mod time;

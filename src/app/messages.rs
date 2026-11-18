@@ -4,10 +4,10 @@ use gpui::{
 };
 
 use crate::{
-    account::{Account, Change, Entry, TimelineChanged},
-    chat::MessageKind,
+    account::{Account, Change, Entry, Row, TimelineChanged},
+    chat::{MessageKind, Presence},
     theme::ActiveTheme,
-    ui::{Button, Color, Divider, Label, MessageRow, TextSize},
+    ui::{Avatar, Button, Color, Divider, Label, MessageRow, TextSize},
 };
 
 /// How near the oldest loaded message scrolling comes before older ones are asked for.
@@ -132,11 +132,11 @@ impl Render for Messages {
             return note("Select a conversation.").into_any_element();
         };
         let account = self.account.read(cx);
-        let title = account
+        let about = account
             .rows()
             .iter()
             .find(|row| row.id == conversation)
-            .map(|row| row.title.clone())
+            .cloned()
             .unwrap_or_default();
         let timeline = account.timeline(&conversation);
         let loading_older = timeline.is_some_and(|timeline| timeline.is_loading_older());
@@ -188,12 +188,26 @@ impl Render for Messages {
             .px(theme.spacing.lg)
             .pb(theme.spacing.md)
             .child(
-                div().flex_1().overflow_hidden().child(
-                    Label::new(title)
-                        .size(TextSize::Large)
-                        .emphasized()
-                        .truncate(),
-                ),
+                Avatar::new(about.title.clone())
+                    .photo(about.photo.clone())
+                    .presence(about.presence),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(about.title.clone())
+                            .size(TextSize::Large)
+                            .emphasized()
+                            .truncate(),
+                    )
+                    .children(status_line(&about).map(|status| {
+                        Label::new(status)
+                            .size(TextSize::Small)
+                            .color(Color::Muted)
+                            .truncate()
+                    })),
             )
             .children(loading_older.then(|| {
                 Label::new("Loading earlier messages…")
@@ -212,6 +226,21 @@ impl Render for Messages {
     }
 }
 
+/// How the person a conversation is with is doing, in words.
+fn status_line(row: &Row) -> Option<SharedString> {
+    let presence = match row.presence? {
+        Presence::Active => "Active",
+        Presence::Idle => "Idle",
+        Presence::Away => "Away",
+        Presence::DoNotDisturb => "Do not disturb",
+    };
+    Some(if row.note.is_empty() {
+        presence.into()
+    } else {
+        format!("{presence} · {}", row.note).into()
+    })
+}
+
 fn row(entry: &Entry) -> MessageRow {
     if entry.kind == MessageKind::Notice {
         let notice = MessageRow::notice(entry.text.clone());
@@ -221,6 +250,7 @@ fn row(entry: &Entry) -> MessageRow {
         };
     }
     let mut row = MessageRow::new(entry.sender.clone(), entry.time.clone())
+        .photo(entry.photo.clone())
         .text(entry.text.clone())
         .continues(!entry.leads)
         .edited(entry.edited);
@@ -242,7 +272,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        account::{Row, Status},
+        account::Status,
         chat::{Message, Page, UserId},
         ui::Root,
     };
@@ -255,7 +285,7 @@ mod tests {
             id: id.to_owned().into(),
             title: format!("Person {id}").into(),
             unread: unread.map(|unread| unread.to_owned().into()),
-            muted: false,
+            ..Default::default()
         }
     }
 

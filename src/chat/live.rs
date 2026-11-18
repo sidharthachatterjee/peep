@@ -9,6 +9,7 @@
 mod frames;
 
 use std::{
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,14 +22,17 @@ use serde_json::{Value, json};
 
 use self::frames::{Frame, Payload, Reader};
 use super::{
-    Event,
+    Event, UserId,
     client::{Error, Inner, ORIGIN, network, refusal},
     events, wire,
 };
 use crate::session;
 
-/// The watch on the signed-in person's events. A channel can carry more watches.
+/// The watch on the signed-in person's events. Watches on other people's availability are
+/// numbered after it.
 const WATCH: u64 = 1;
+/// Watches asked for in one request.
+const WATCHES_PER_REQUEST: usize = 50;
 /// Sent with every watch, as the web client sends it.
 const WATCH_VERSION: [u8; 2] = [9, 5];
 /// The channel's credentials are renewed this often, as the web client does.
@@ -151,6 +155,22 @@ impl Registration {
     }
 }
 
+/// Starts watch `watch` on whether `person` is around.
+fn watch_person(watch: u64, person: &UserId) -> String {
+    let stream = json!([
+        ["user-state-changes"],
+        [1],
+        [[["state"], ["user"], [&*person.0], ["availability"]]]
+    ]);
+    let spec = json!([null, null, null, WATCH_VERSION, null, stream, null, null, 1]);
+    json!([[[watch, spec]]]).to_string()
+}
+
+/// Ends watch `watch`.
+fn unwatch(watch: u64) -> String {
+    json!([[[watch, null, []]]]).to_string()
+}
+
 /// A number that may be written as a number or as a string.
 fn integer(value: &Value) -> Option<i64> {
     value
@@ -183,34 +203,38 @@ impl Server {
     }
 }
 
-/// One thing the channel says about the watch.
+/// One thing the channel says. Most are about one watch, named by its number.
 #[derive(Clone, Debug, PartialEq)]
 enum Update {
     /// The channel's id, for renewing its credentials.
     Channel(String),
     /// The watch is running.
-    Started,
+    Started(u64),
     /// Everything up to this moment has been sent.
-    Watermark(i64),
-    /// An event, still encoded.
-    Change(Vec<u8>),
-    /// The server will not run the watch from where it was asked to.
-    Refused,
+    Watermark(u64, i64),
+    /// What the watch reports, still encoded.
+    Change(u64, Vec<u8>),
+    /// The server will not run the watch as it was asked to.
+    Refused(u64),
     /// The server wants a new channel.
     Close,
 }
 
-/// What one batch from the channel says about the watch on the person's events.
+/// What one batch from the channel says.
 fn updates(batch: &Value) -> Vec<Update> {
     let mut updates = Vec::new();
     let responses = batch.get(0).and_then(Value::as_array);
     for response in responses.into_iter().flatten() {
-        if response.get(0).and_then(integer) != Some(WATCH as i64) {
+        let Some(watch) = response
+            .get(0)
+            .and_then(integer)
+            .and_then(|watch| u64::try_from(watch).ok())
+        else {
             continue;
-        }
+        };
         if let Some(change) = response.get(1).filter(|change| change.is_array()) {
             if change.get(0).and_then(|started| started.get(0)).is_some() {
-                updates.push(Update::Started);
+                updates.push(Update::Started(watch));
             }
             let items = change
                 .get(1)
@@ -221,13 +245,13 @@ fn updates(batch: &Value) -> Vec<Update> {
                     .get(1)
                     .and_then(Value::as_str)
                     .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok());
-                updates.extend(payload.map(Update::Change));
+                updates.extend(payload.map(|payload| Update::Change(watch, payload)));
             }
             if let Some(mark) = change.get(2).and_then(|mark| mark.get(0)).and_then(integer) {
-                updates.push(Update::Watermark(mark));
+                updates.push(Update::Watermark(watch, mark));
             }
             if change.get(4).is_some_and(Value::is_array) {
-                updates.push(Update::Refused);
+                updates.push(Update::Refused(watch));
             }
         }
         let failed = response
@@ -237,7 +261,7 @@ fn updates(batch: &Value) -> Vec<Update> {
             .and_then(integer)
             .is_some_and(|code| code != 0);
         if failed {
-            updates.push(Update::Refused);
+            updates.push(Update::Refused(watch));
         }
     }
     if batch.get(1).and_then(|flag| flag.get(0)).and_then(integer) == Some(1) {
@@ -251,6 +275,48 @@ fn updates(batch: &Value) -> Vec<Update> {
         updates.push(Update::Channel(channel.to_owned()));
     }
     updates
+}
+
+/// The watches one channel carries on people's availability.
+struct People {
+    /// The number of each person's watch.
+    watching: HashMap<UserId, u64>,
+    watched_by: HashMap<u64, UserId>,
+    /// People the server would not watch, who are not asked about again on this channel.
+    refused: HashSet<UserId>,
+    next_watch: u64,
+    /// The number of the last request sent, and how many messages have been sent in all.
+    request: u32,
+    sent: usize,
+}
+
+impl People {
+    /// The messages that bring the channel's watches in line with `wanted`.
+    fn changes(&mut self, wanted: &[UserId]) -> Vec<String> {
+        let mut changes = Vec::new();
+        let gone: Vec<UserId> = self
+            .watching
+            .keys()
+            .filter(|person| !wanted.contains(person))
+            .cloned()
+            .collect();
+        for person in gone {
+            if let Some(watch) = self.watching.remove(&person) {
+                self.watched_by.remove(&watch);
+                changes.push(unwatch(watch));
+            }
+        }
+        for person in wanted {
+            if self.watching.contains_key(person) || self.refused.contains(person) {
+                continue;
+            }
+            self.next_watch += 1;
+            self.watching.insert(person.clone(), self.next_watch);
+            self.watched_by.insert(self.next_watch, person.clone());
+            changes.push(watch_person(self.next_watch, person));
+        }
+        changes
+    }
 }
 
 /// Why a channel ended.
@@ -387,6 +453,16 @@ impl Inner {
         let mut acknowledged = 0;
         let mut channel_id: Option<String> = None;
         let mut renew_credentials_at = Instant::now() + RENEW_CREDENTIALS;
+        let mut people = People {
+            watching: HashMap::new(),
+            watched_by: HashMap::new(),
+            refused: HashSet::new(),
+            next_watch: WATCH,
+            request,
+            sent: 1,
+        };
+        // A new channel watches no one yet.
+        let mut people_changed = true;
         loop {
             let poll = self
                 .live(
@@ -419,10 +495,54 @@ impl Inner {
             let mut reader = Reader::default();
             let mut heard_any = false;
             loop {
-                let chunk = tokio::time::timeout(patience, response.chunk())
-                    .await
-                    .map_err(|_| Error::Network("the live channel went quiet".into()))?
-                    .map_err(network)?;
+                if std::mem::take(&mut people_changed) {
+                    let wanted = self
+                        .watched
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    for messages in people.changes(&wanted).chunks(WATCHES_PER_REQUEST) {
+                        people.request += 1;
+                        let count = messages.len().to_string();
+                        let offset = people.sent.to_string();
+                        people.sent += messages.len();
+                        let mut form =
+                            vec![("count".to_owned(), count), ("ofs".to_owned(), offset)];
+                        for (index, message) in messages.iter().enumerate() {
+                            form.push((format!("req{index}___data__"), message.clone()));
+                        }
+                        let change = self
+                            .live(
+                                Method::POST,
+                                &registration,
+                                channel,
+                                &[
+                                    &common[..],
+                                    &[
+                                        ("SID", &session),
+                                        ("RID", &people.request.to_string()),
+                                        ("AID", &acknowledged.to_string()),
+                                        ("t", "1"),
+                                    ],
+                                ]
+                                .concat(),
+                            )
+                            .await?
+                            .header("X-WebChannel-Content-Type", JSON_PROTOBUF)
+                            .form(&form);
+                        send(change).await?;
+                    }
+                }
+
+                let chunk = tokio::select! {
+                    chunk = tokio::time::timeout(patience, response.chunk()) => chunk
+                        .map_err(|_| Error::Network("the live channel went quiet".into()))?
+                        .map_err(network)?,
+                    () = self.watched_changed.notified() => {
+                        people_changed = true;
+                        continue;
+                    }
+                };
                 let Some(chunk) = chunk else { break };
                 let frames = reader
                     .feed(&chunk)
@@ -438,20 +558,21 @@ impl Inner {
                         _ => continue,
                     };
                     for update in updates(&batch) {
-                        match update {
-                            Update::Channel(id) => channel_id = Some(id),
-                            Update::Watermark(mark) => {
-                                stream.resume = Some(stream.resume.unwrap_or(0).max(mark));
+                        let heard = match update {
+                            Update::Channel(id) => {
+                                channel_id = Some(id);
+                                continue;
                             }
-                            Update::Started if !stream.connected => {
+                            Update::Watermark(WATCH, mark) => {
+                                stream.resume = Some(stream.resume.unwrap_or(0).max(mark));
+                                continue;
+                            }
+                            Update::Started(WATCH) if !stream.connected => {
                                 stream.connected = true;
                                 let gap = std::mem::take(&mut stream.gap);
-                                if listener.unbounded_send(Event::Connected { gap }).is_err() {
-                                    return Ok(Ended::Unheard);
-                                }
+                                vec![Event::Connected { gap }]
                             }
-                            Update::Started => {}
-                            Update::Change(change) => {
+                            Update::Change(WATCH, change) => {
                                 if stream.recent.contains(&change) {
                                     continue;
                                 }
@@ -461,13 +582,9 @@ impl Inner {
                                     stream.recent.remove(0);
                                 }
                                 stream.recent.push(change);
-                                for event in report.map(events).unwrap_or_default() {
-                                    if listener.unbounded_send(event).is_err() {
-                                        return Ok(Ended::Unheard);
-                                    }
-                                }
+                                report.map(events).unwrap_or_default()
                             }
-                            Update::Refused => {
+                            Update::Refused(WATCH) => {
                                 // Too far back to resume: start again from now, and say
                                 // that what happened in between is not known.
                                 stream.resume = None;
@@ -478,6 +595,23 @@ impl Inner {
                             }
                             Update::Close => {
                                 return Err(Error::Network("the live channel closed".into()));
+                            }
+                            // What a watch on a person reports is an event like any other.
+                            Update::Change(_, change) => wire::Event::decode(change.as_slice())
+                                .map(events)
+                                .unwrap_or_default(),
+                            Update::Refused(watch) => {
+                                if let Some(person) = people.watched_by.remove(&watch) {
+                                    people.watching.remove(&person);
+                                    people.refused.insert(person);
+                                }
+                                continue;
+                            }
+                            Update::Started(_) | Update::Watermark(..) => continue,
+                        };
+                        for event in heard {
+                            if listener.unbounded_send(event).is_err() {
+                                return Ok(Ended::Unheard);
                             }
                         }
                     }
@@ -657,35 +791,78 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_says_what_happened_to_the_watch() {
+    fn a_batch_says_what_happened_to_each_watch() {
         let read = |batch: &str| updates(&serde_json::from_str(batch).unwrap());
 
         assert_eq!(
             read(r#"[null,null,["ch1"]]"#),
             [Update::Channel("ch1".into())]
         );
-        assert_eq!(read(r#"[[["1",[["100"]]]]]"#), [Update::Started]);
+        assert_eq!(read(r#"[[["1",[["100"]]]]]"#), [Update::Started(1)]);
         assert_eq!(
             read(r#"[[[1,[null,[[[null,"CAE=","9"]]]]]]]"#),
-            [Update::Change(vec![8, 1])]
+            [Update::Change(1, vec![8, 1])]
         );
         assert_eq!(
             read(r#"[[["1",[null,null,["300"]]]]]"#),
-            [Update::Watermark(300)]
+            [Update::Watermark(1, 300)]
         );
         assert_eq!(
-            read(r#"[[["1",null,[[14,null,"busy"]]]]]"#),
-            [Update::Refused]
+            read(r#"[[["7",null,[[14,null,"busy"]]]]]"#),
+            [Update::Refused(7)]
         );
         assert_eq!(
             read(r#"[[["1",[null,null,null,null,[[1]]]]]]"#),
-            [Update::Refused]
+            [Update::Refused(1)]
         );
         assert_eq!(read(r#"[null,[1]]"#), [Update::Close]);
         assert_eq!(
-            read(r#"[[["2",[null,null,["300"]]]]]"#),
-            [],
-            "another watch's news"
+            read(r#"[[[2,[["100"]]],[3,[null,[[[null,"CAE="]]]]]]]"#),
+            [Update::Started(2), Update::Change(3, vec![8, 1])],
+            "several watches in one batch"
+        );
+    }
+
+    #[test]
+    fn watching_a_person_matches_what_the_web_client_sends() {
+        assert_eq!(
+            watch_person(2, &UserId("123".into())),
+            r#"[[[2,[null,null,null,[9,5],null,[["user-state-changes"],[1],[[["state"],["user"],["123"],["availability"]]]],null,null,1]]]]"#
+        );
+        assert_eq!(unwatch(2), "[[[2,null,[]]]]");
+    }
+
+    #[test]
+    fn a_channels_watches_follow_who_is_wanted() {
+        let mut people = People {
+            watching: HashMap::new(),
+            watched_by: HashMap::new(),
+            refused: HashSet::new(),
+            next_watch: WATCH,
+            request: 0,
+            sent: 1,
+        };
+        let person = |id: &str| UserId(id.into());
+
+        let changes = people.changes(&[person("a"), person("b")]);
+        assert_eq!(
+            changes,
+            [watch_person(2, &person("a")), watch_person(3, &person("b"))]
+        );
+        assert_eq!(
+            people.changes(&[person("a"), person("b")]),
+            [] as [String; 0]
+        );
+
+        let changes = people.changes(&[person("b"), person("c")]);
+        assert_eq!(changes, [unwatch(2), watch_person(4, &person("c"))]);
+        assert_eq!(people.watched_by.get(&3), Some(&person("b")));
+
+        people.refused.insert(person("d"));
+        assert_eq!(
+            people.changes(&[person("b"), person("c"), person("d")]),
+            [] as [String; 0],
+            "someone the server would not watch is not asked about again"
         );
     }
 }

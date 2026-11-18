@@ -3,7 +3,8 @@
 mod timeline;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    ops::Range,
     time::{Duration, Instant},
 };
 
@@ -13,7 +14,11 @@ use gpui::{AppContext as _, Context, EventEmitter, SharedString, Task};
 pub use self::timeline::{Change, Entry, Timeline};
 use crate::{
     cache,
-    chat::{self, Client, ConversationId, Directory, Event, Message, MessageKind, Page, Snapshot},
+    chat::{
+        self, Client, ConversationId, Directory, Event, Message, MessageKind, Page, Presence,
+        Snapshot, Status as PersonStatus, UserId,
+    },
+    photos,
     session::{self, Session, SignIn},
     theme::ActiveTheme,
 };
@@ -27,6 +32,16 @@ const STALE_AFTER: Duration = Duration::from_secs(20);
 const RELOAD_ON_RECONNECT_AFTER: Duration = Duration::from_secs(3);
 /// How long a change to the list waits for more changes before the list is reloaded once.
 const SETTLE: Duration = Duration::from_millis(500);
+/// How many rows past each end of what the list shows have their people watched too, so
+/// scrolling a little shows dots that are already current.
+const WATCHED_BEYOND_VIEW: usize = 15;
+/// The most people watched at once. Google's own client watches those on screen.
+const MOST_WATCHED: usize = 100;
+/// How long the list must hold still before the people watched change with it.
+const WATCH_SETTLE: Duration = Duration::from_millis(300);
+/// How often the watched people's do-not-disturb and notes are asked for while Peep is in
+/// front. Google reports comings and goings as they happen, but not these.
+const SETTINGS_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often Chrome is asked whether the sign-in has finished.
 const SIGN_IN_POLL: Duration = Duration::from_millis(400);
 /// How many of the most recent conversations have their messages loaded ahead of being
@@ -50,13 +65,21 @@ pub enum Status {
 }
 
 /// One row of the conversation list, ready to draw.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
     pub id: SharedString,
     pub title: SharedString,
     /// The unread count as shown, if there is anything unread.
     pub unread: Option<SharedString>,
     pub muted: bool,
+    /// The other person, when the conversation is with one person.
+    pub person: Option<UserId>,
+    /// Where that person's photo is.
+    pub photo: Option<SharedString>,
+    /// Whether that person is around, once Google has said.
+    pub presence: Option<Presence>,
+    /// What that person says they are doing, or nothing.
+    pub note: SharedString,
 }
 
 /// The messages of a conversation changed.
@@ -73,6 +96,24 @@ pub struct Account {
     directory: Directory,
     /// Messages loaded so far, by conversation.
     timelines: HashMap<SharedString, Timeline>,
+    /// How people are doing, as last heard.
+    statuses: HashMap<UserId, PersonStatus>,
+    /// The rows the list shows, and the open conversation: their people are watched.
+    rows_in_view: Range<usize>,
+    open_conversation: Option<SharedString>,
+    /// The people the live channel reports on as they come and go.
+    watched: Vec<UserId>,
+    /// Those of them it has reported on since it connected. What it says about someone
+    /// is newer than what asking says.
+    reported: HashSet<UserId>,
+    /// Whether the live channel has connected before, so a connection is a reconnection.
+    reconnected: bool,
+    /// Waits for the list to hold still before changing who is watched.
+    watch_task: Option<Task<()>>,
+    /// Asks for the watched people's settings every so often while Peep is in front.
+    settings_task: Option<Task<()>>,
+    /// When their settings were last asked for.
+    settings_asked: Option<Instant>,
     /// False for an account made with [`Account::with`], which never starts Chrome.
     live: bool,
     /// What the last launch kept, until a client takes it over.
@@ -98,7 +139,7 @@ impl Account {
         let kept = cache::folder()
             .map(|folder| cache::read(&folder))
             .unwrap_or_default();
-        let rows = rows(&kept.directory);
+        let rows = rows(&kept.directory, &HashMap::new());
         let status = if rows.is_empty() {
             Status::Starting
         } else {
@@ -119,6 +160,15 @@ impl Account {
             rows,
             directory: Directory::default(),
             timelines: HashMap::new(),
+            statuses: HashMap::new(),
+            rows_in_view: 0..0,
+            open_conversation: None,
+            watched: Vec::new(),
+            reported: HashSet::new(),
+            reconnected: false,
+            watch_task: None,
+            settings_task: None,
+            settings_asked: None,
             live: false,
             kept: Snapshot::default(),
             client: None,
@@ -158,6 +208,129 @@ impl Account {
     /// The direct messages, most recently active first.
     pub fn rows(&self) -> &[Row] {
         &self.rows
+    }
+
+    /// Says which rows the list shows and which conversation is open. The people in them
+    /// are watched: the live channel reports their comings and goings as they happen.
+    pub fn show_rows(
+        &mut self,
+        rows: Range<usize>,
+        open: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if (&self.rows_in_view, &self.open_conversation) != (&rows, &open) {
+            self.rows_in_view = rows;
+            self.open_conversation = open;
+            self.watch_soon(cx);
+        }
+    }
+
+    /// Says whether Peep's window is in front. While it is, the watched people's settings
+    /// are asked for every so often.
+    pub fn set_frontmost(&mut self, frontmost: bool, cx: &mut Context<Self>) {
+        if !frontmost {
+            self.settings_task = None;
+        } else if self.settings_task.is_none() {
+            let wait = self.settings_asked.map_or(SETTINGS_EVERY, |asked| {
+                SETTINGS_EVERY.saturating_sub(asked.elapsed())
+            });
+            let timer = cx.background_executor().clone();
+            self.settings_task = Some(cx.spawn(async move |this, cx| {
+                let mut wait = wait;
+                loop {
+                    timer.timer(wait).await;
+                    let asked = this.update(cx, |this, cx| this.ask(this.watched.clone(), cx));
+                    if asked.is_err() {
+                        return;
+                    }
+                    wait = SETTINGS_EVERY;
+                }
+            }));
+        }
+    }
+
+    /// Changes who is watched once the list has held still for a moment, so scrolling
+    /// through it does not watch everyone it passes.
+    fn watch_soon(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().timer(WATCH_SETTLE);
+        self.watch_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| this.watch(cx)).ok();
+        }));
+    }
+
+    fn watch(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else { return };
+        let people = people_in_view(&self.rows, &self.rows_in_view, &self.open_conversation);
+        // The same people in another order need nothing done.
+        if people.len() == self.watched.len()
+            && people.iter().all(|person| self.watched.contains(person))
+        {
+            return;
+        }
+        let new: Vec<UserId> = people
+            .iter()
+            .filter(|person| !self.watched.contains(person))
+            .cloned()
+            .collect();
+        client.watch(people.clone());
+        self.watched = people;
+        // The channel reports changes from now on; how they are doing now is asked.
+        self.ask(new, cx);
+    }
+
+    /// Asks how `people` are doing.
+    fn ask(&mut self, people: Vec<UserId>, cx: &mut Context<Self>) {
+        let Some(client) = self.client.as_ref().filter(|_| !people.is_empty()) else {
+            return;
+        };
+        if people == self.watched {
+            self.settings_asked = Some(Instant::now());
+        }
+        let asked = client.statuses(&people);
+        cx.spawn(async move |this, cx| {
+            // A failed request leaves what was last heard in place.
+            if let Ok(statuses) = asked.await {
+                this.update(cx, |this, cx| this.statuses_arrived(statuses, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn statuses_arrived(
+        &mut self,
+        statuses: HashMap<UserId, PersonStatus>,
+        cx: &mut Context<Self>,
+    ) {
+        for (person, mut status) in statuses {
+            // Asking lags behind what the channel reported about someone.
+            if self.reported.contains(&person)
+                && let Some(known) = self.statuses.get(&person)
+            {
+                status.availability = known.availability;
+            }
+            self.statuses.insert(person, status);
+        }
+        self.statuses_changed(cx);
+    }
+
+    /// Redraws the rows whose people are doing differently.
+    fn statuses_changed(&mut self, cx: &mut Context<Self>) {
+        let before: Vec<_> = self
+            .rows
+            .iter()
+            .map(|row| (row.presence, row.note.clone()))
+            .collect();
+        show_statuses(&mut self.rows, &self.statuses);
+        let changed = self
+            .rows
+            .iter()
+            .zip(before)
+            .any(|(row, before)| (row.presence, &row.note) != (before.0, &before.1));
+        if changed {
+            cx.notify();
+        }
     }
 
     /// The messages of a conversation, once [`Account::open`] has asked for them.
@@ -255,7 +428,7 @@ impl Account {
         let directory = &self.directory;
         let timeline = self.timelines.entry(conversation.clone()).or_default();
         let change = match page {
-            Ok(page) => timeline.merge_newest(page, |message| sender(directory, message)),
+            Ok(page) => timeline.merge_newest(page, |message| sender_of(directory, message)),
             Err(error) => {
                 timeline.loading = false;
                 // A failed reload leaves the messages already showing in place.
@@ -279,7 +452,7 @@ impl Account {
             return;
         };
         let change = match page {
-            Ok(page) => timeline.merge_older(page, |message| sender(directory, message)),
+            Ok(page) => timeline.merge_older(page, |message| sender_of(directory, message)),
             Err(_) => {
                 // Scrolling up again asks again.
                 timeline.loading_older = false;
@@ -422,9 +595,11 @@ impl Account {
     fn loaded(&mut self, result: Result<Snapshot, chat::Error>, cx: &mut Context<Self>) {
         match result {
             Ok(snapshot) => {
-                self.rows = rows(&snapshot.directory);
+                self.rows = rows(&snapshot.directory, &self.statuses);
                 self.directory = snapshot.directory.clone();
                 self.set_status(Status::Ready, cx);
+                // The same rows may now hold other people.
+                self.watch_soon(cx);
                 let recent: Vec<SharedString> = self
                     .rows
                     .iter()
@@ -456,6 +631,11 @@ impl Account {
         match event {
             Event::Connected { gap } => {
                 self.connected = true;
+                // A new channel says nothing about what happened while there was none.
+                self.reported.clear();
+                if std::mem::replace(&mut self.reconnected, true) {
+                    self.ask(self.watched.clone(), cx);
+                }
                 if gap {
                     for timeline in self.timelines.values_mut() {
                         timeline.outdated = true;
@@ -487,7 +667,7 @@ impl Account {
                 let change = self
                     .timelines
                     .get_mut(&key)
-                    .and_then(|timeline| timeline.remove(&message, |m| sender(directory, m)));
+                    .and_then(|timeline| timeline.remove(&message, |m| sender_of(directory, m)));
                 if change.is_some() {
                     self.changed(&key, change, cx);
                 }
@@ -504,9 +684,32 @@ impl Account {
                     && (known.unread > 0) != unread
                 {
                     known.unread = u32::from(unread);
-                    self.rows = rows(&self.directory);
+                    self.rows = rows(&self.directory, &self.statuses);
                     cx.notify();
                 }
+            }
+            Event::Status {
+                person,
+                quiet,
+                note,
+            } => {
+                // Only someone already asked about is shown, so only they are kept.
+                if let Some(status) = self.statuses.get_mut(&person) {
+                    status.quiet = quiet;
+                    status.note = note;
+                    self.statuses_changed(cx);
+                }
+            }
+            Event::Availability {
+                person,
+                availability,
+            } => {
+                self.statuses
+                    .entry(person.clone())
+                    .or_default()
+                    .availability = availability;
+                self.reported.insert(person);
+                self.statuses_changed(cx);
             }
             Event::ListChanged => self.reload_soon(cx),
             Event::Other(_) => {}
@@ -541,7 +744,9 @@ impl Account {
             self.directory
                 .conversations
                 .sort_by_key(|conversation| std::cmp::Reverse(conversation.sort_time));
-            self.rows = rows(&self.directory);
+            self.rows = rows(&self.directory, &self.statuses);
+            // The same rows now hold other people.
+            self.watch_soon(cx);
         }
 
         let key: SharedString = conversation.key().into();
@@ -549,7 +754,7 @@ impl Account {
         let change = self
             .timelines
             .get_mut(&key)
-            .and_then(|timeline| timeline.apply(message, posted, |m| sender(directory, m)));
+            .and_then(|timeline| timeline.apply(message, posted, |m| sender_of(directory, m)));
         self.changed(&key, change, cx);
     }
 
@@ -571,8 +776,14 @@ impl Account {
         self.rows.clear();
         self.directory = Directory::default();
         self.timelines.clear();
+        self.statuses.clear();
+        self.watched.clear();
+        self.reported.clear();
+        self.watch_task = None;
+        self.settings_task = None;
         self.set_status(Status::SignedOut, cx);
         cx.background_spawn(async {
+            photos::forget();
             if let Some(folder) = cache::folder()
                 && let Err(error) = cache::clear(&folder)
             {
@@ -589,40 +800,321 @@ impl Account {
 }
 
 /// Who a message is shown as being from.
-fn sender(directory: &Directory, message: &Message) -> SharedString {
+fn sender_of(directory: &Directory, message: &Message) -> (SharedString, Option<SharedString>) {
+    let known = directory.users.get(&message.sender);
+    let photo = known.and_then(|user| photo(&user.photo));
     if directory.me.as_ref() == Some(&message.sender) {
-        return YOU.into();
+        return (YOU.into(), photo);
     }
-    let known = directory.users.get(&message.sender).map(|user| {
-        if user.name.is_empty() {
-            &user.email
-        } else {
-            &user.name
-        }
-    });
-    match known.filter(|name| !name.is_empty()) {
+    let name = known
+        .map(|user| {
+            if user.name.is_empty() {
+                &user.email
+            } else {
+                &user.name
+            }
+        })
+        .filter(|name| !name.is_empty());
+    let name = match name {
         Some(name) => SharedString::from(name.clone()),
         None if !message.sender_name.is_empty() => SharedString::from(message.sender_name.clone()),
         None => UNKNOWN_SENDER.into(),
+    };
+    (name, photo)
+}
+
+fn photo(address: &str) -> Option<SharedString> {
+    (!address.is_empty()).then(|| SharedString::from(address.to_owned()))
+}
+
+/// The people to watch: those in the rows the list shows and a little beyond, and the
+/// person the open conversation is with.
+fn people_in_view(
+    rows: &[Row],
+    in_view: &Range<usize>,
+    open: &Option<SharedString>,
+) -> Vec<UserId> {
+    let start = in_view
+        .start
+        .saturating_sub(WATCHED_BEYOND_VIEW)
+        .min(rows.len());
+    let end = (in_view.end + WATCHED_BEYOND_VIEW).min(rows.len());
+    let open = rows
+        .iter()
+        .find(|row| open.as_ref() == Some(&row.id))
+        .and_then(|row| row.person.clone());
+    let mut people: Vec<UserId> = Vec::new();
+    for person in open
+        .into_iter()
+        .chain(rows[start..end].iter().filter_map(|row| row.person.clone()))
+    {
+        if people.len() < MOST_WATCHED && !people.contains(&person) {
+            people.push(person);
+        }
+    }
+    people
+}
+
+/// Puts how each row's person is doing into the rows.
+fn show_statuses(rows: &mut [Row], statuses: &HashMap<UserId, PersonStatus>) {
+    for row in rows {
+        let status = row.person.as_ref().and_then(|person| statuses.get(person));
+        row.presence = status.map(PersonStatus::presence);
+        row.note = status.map_or_else(SharedString::default, |status| {
+            SharedString::from(status.note.clone())
+        });
     }
 }
 
 /// The conversation list as drawn, most recently active first.
-fn rows(directory: &Directory) -> Vec<Row> {
-    directory
+fn rows(directory: &Directory, statuses: &HashMap<UserId, PersonStatus>) -> Vec<Row> {
+    let mut rows: Vec<Row> = directory
         .conversations
         .iter()
-        .map(|conversation| Row {
-            id: conversation.id.key().into(),
-            title: SharedString::from(conversation.title.clone()),
-            unread: match conversation.unread {
-                0 => None,
-                unread if unread > MOST_UNREAD_SHOWN => {
-                    Some(format!("{MOST_UNREAD_SHOWN}+").into())
-                }
-                unread => Some(unread.to_string().into()),
-            },
-            muted: conversation.muted,
+        .map(|conversation| {
+            let person = match (&conversation.id, conversation.members.as_slice()) {
+                (ConversationId::Dm(_), [person]) => Some(person.clone()),
+                _ => None,
+            };
+            Row {
+                id: conversation.id.key().into(),
+                title: SharedString::from(conversation.title.clone()),
+                unread: match conversation.unread {
+                    0 => None,
+                    unread if unread > MOST_UNREAD_SHOWN => {
+                        Some(format!("{MOST_UNREAD_SHOWN}+").into())
+                    }
+                    unread => Some(unread.to_string().into()),
+                },
+                muted: conversation.muted,
+                photo: person
+                    .as_ref()
+                    .and_then(|person| directory.users.get(person))
+                    .and_then(|user| photo(&user.photo)),
+                person,
+                presence: None,
+                note: SharedString::default(),
+            }
         })
-        .collect()
+        .collect();
+    show_statuses(&mut rows, statuses);
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use super::*;
+    use crate::chat::{Availability, Conversation, User};
+
+    fn directory() -> Directory {
+        let person = |name: &str, photo: &str| User {
+            name: name.into(),
+            email: "".into(),
+            photo: photo.into(),
+        };
+        let conversation = |id: ConversationId, members: &[&str], sort_time| Conversation {
+            id,
+            title: members.join(", ").into(),
+            members: members.iter().map(|id| UserId((*id).into())).collect(),
+            name: None,
+            unread: 0,
+            muted: false,
+            sort_time,
+        };
+        Directory {
+            me: Some(UserId("me".into())),
+            conversations: vec![
+                conversation(ConversationId::Dm("a".into()), &["ada"], 3),
+                conversation(ConversationId::Space("s".into()), &["ada", "grace"], 2),
+                conversation(ConversationId::Dm("g".into()), &["grace"], 1),
+            ],
+            users: [
+                (UserId("ada".into()), person("Ada", "//photos/ada")),
+                (UserId("grace".into()), person("Grace", "")),
+                (UserId("me".into()), person("Me", "//photos/me")),
+            ]
+            .into(),
+        }
+    }
+
+    fn status(availability: Availability, quiet: bool, note: &str) -> PersonStatus {
+        PersonStatus {
+            availability,
+            quiet,
+            note: note.into(),
+        }
+    }
+
+    #[test]
+    fn a_row_with_one_person_shows_their_photo_and_how_they_are_doing() {
+        let statuses = [
+            (
+                UserId("ada".into()),
+                status(Availability::Idle, false, "Lunch"),
+            ),
+            (
+                UserId("grace".into()),
+                status(Availability::Active, true, ""),
+            ),
+        ]
+        .into();
+
+        let rows = rows(&directory(), &statuses);
+
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                let photo = row.photo.as_ref().map(|photo| photo.as_ref());
+                (photo, row.presence, row.note.as_ref())
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (Some("//photos/ada"), Some(Presence::Idle), "Lunch"),
+                (None, None, ""),
+                (None, Some(Presence::DoNotDisturb), ""),
+            ],
+            "a group shows neither; someone without a photo shows none"
+        );
+    }
+
+    #[test]
+    fn a_message_is_from_you_or_from_the_person_by_name() {
+        let directory = directory();
+        let from = |sender: &str, name: &str| {
+            let message = Message {
+                id: "m".into(),
+                sender: UserId(sender.into()),
+                sender_name: name.into(),
+                time: 0,
+                kind: MessageKind::Sent,
+                text: "".into(),
+                attachments: Vec::new(),
+                edited: false,
+            };
+            let (name, photo) = sender_of(&directory, &message);
+            (name.to_string(), photo.map(|photo| photo.to_string()))
+        };
+
+        assert_eq!(from("me", ""), ("You".into(), Some("//photos/me".into())));
+        assert_eq!(from("ada", ""), ("Ada".into(), Some("//photos/ada".into())));
+        assert_eq!(from("stranger", "Alan"), ("Alan".into(), None));
+        assert_eq!(from("stranger", ""), ("Unknown".into(), None));
+    }
+
+    #[test]
+    fn the_people_watched_are_those_on_screen_and_in_the_open_conversation() {
+        let row = |id: &str, person: Option<&str>| Row {
+            id: id.to_owned().into(),
+            person: person.map(|person| UserId(person.into())),
+            ..Default::default()
+        };
+        let mut rows: Vec<Row> = (0..200)
+            .map(|n| row(&format!("dm/{n}"), Some(&format!("p{n}"))))
+            .collect();
+        rows[41] = row("space/s", None);
+        rows[42] = row("dm/again", Some("p40"));
+        let watched = |in_view: Range<usize>, open: Option<&str>| {
+            let open = open.map(|open| SharedString::from(open.to_owned()));
+            let people = people_in_view(&rows, &in_view, &open);
+            people
+                .iter()
+                .map(|person| person.0.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let near = watched(40..44, None);
+        assert_eq!(
+            near.first().map(String::as_str),
+            Some("p25"),
+            "a little before"
+        );
+        assert_eq!(
+            near.last().map(String::as_str),
+            Some("p58"),
+            "and a little after"
+        );
+        assert_eq!(
+            near.len(),
+            32,
+            "a group has no one to watch; no one is watched twice"
+        );
+
+        let with_open = watched(0..2, Some("dm/150"));
+        assert_eq!(with_open[..2], ["p150", "p0"]);
+        assert_eq!(watched(0..2, Some("dm/1")).len(), 17, "already on screen");
+
+        assert_eq!(watched(0..200, None).len(), MOST_WATCHED);
+        assert_eq!(watched(500..600, None), Vec::<String>::new());
+    }
+
+    #[gpui::test]
+    fn what_is_heard_about_a_person_changes_their_row(cx: &mut TestAppContext) {
+        let account = cx.new(|_| {
+            let mut account = Account::with(Status::Ready, Vec::new());
+            account.directory = directory();
+            account.rows = rows(&account.directory, &account.statuses);
+            account
+        });
+        let shown = |row: usize, cx: &mut TestAppContext| {
+            account.read_with(cx, |account, _| {
+                let row = &account.rows()[row];
+                (row.presence, row.note.to_string())
+            })
+        };
+        let hear = |event: Event, cx: &mut TestAppContext| {
+            account.update(cx, |account, cx| account.heard(event, cx));
+        };
+        let came_or_went = |person: &str, availability| Event::Availability {
+            person: UserId(person.into()),
+            availability,
+        };
+        let asked = |answers: &[(&str, PersonStatus)], cx: &mut TestAppContext| {
+            let answers = answers
+                .iter()
+                .map(|(person, status)| (UserId((*person).into()), status.clone()))
+                .collect();
+            account.update(cx, |account, cx| account.statuses_arrived(answers, cx));
+        };
+        assert_eq!(shown(0, cx).0, None, "nothing is known yet");
+
+        asked(&[("ada", status(Availability::Away, false, "Lunch"))], cx);
+        assert_eq!(shown(0, cx), (Some(Presence::Away), "Lunch".into()));
+
+        hear(came_or_went("ada", Availability::Active), cx);
+        assert_eq!(shown(0, cx).0, Some(Presence::Active), "as it happens");
+
+        asked(&[("ada", status(Availability::Away, true, ""))], cx);
+        hear(
+            Event::Status {
+                person: UserId("ada".into()),
+                quiet: false,
+                note: "Back".into(),
+            },
+            cx,
+        );
+        assert_eq!(
+            shown(0, cx),
+            (Some(Presence::Active), "Back".into()),
+            "asking does not undo what the channel reported, but brings her settings"
+        );
+
+        hear(came_or_went("grace", Availability::Idle), cx);
+        assert_eq!(
+            shown(2, cx).0,
+            Some(Presence::Idle),
+            "someone not yet asked about"
+        );
+
+        hear(Event::Connected { gap: false }, cx);
+        asked(&[("ada", status(Availability::Away, false, ""))], cx);
+        assert_eq!(
+            shown(0, cx).0,
+            Some(Presence::Away),
+            "a new channel knows nothing of before, so asking is believed"
+        );
+    }
 }

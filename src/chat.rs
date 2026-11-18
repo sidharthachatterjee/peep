@@ -17,6 +17,51 @@ pub struct UserId(pub Arc<str>);
 pub struct User {
     pub name: Arc<str>,
     pub email: Arc<str>,
+    /// Where their photo is, as Google gives it. It may be empty.
+    pub photo: Arc<str>,
+}
+
+/// Whether a person is around.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Availability {
+    /// Using Google Chat or Gmail now.
+    Active,
+    /// Has it open but has not used it for a while.
+    Idle,
+    #[default]
+    Away,
+}
+
+/// What Google Chat shows beside a person's name: whether they are around, unless they
+/// asked not to be disturbed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    Active,
+    Idle,
+    Away,
+    DoNotDisturb,
+}
+
+/// How a person is doing right now.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Status {
+    pub availability: Availability,
+    /// Whether they asked not to be disturbed.
+    pub quiet: bool,
+    /// What they say they are doing, such as "In a meeting", with its emoji in front. Empty
+    /// when they say nothing.
+    pub note: Arc<str>,
+}
+
+impl Status {
+    pub fn presence(&self) -> Presence {
+        match (self.quiet, self.availability) {
+            (true, _) => Presence::DoNotDisturb,
+            (false, Availability::Active) => Presence::Active,
+            (false, Availability::Idle) => Presence::Idle,
+            (false, Availability::Away) => Presence::Away,
+        }
+    }
 }
 
 /// Google Chat keeps a conversation between two people as a DM and a group conversation
@@ -140,6 +185,20 @@ pub enum Event {
     Read {
         conversation: ConversationId,
         unread: bool,
+    },
+    /// A person changed their status settings. Whether they are around is not said.
+    Status {
+        person: UserId,
+        /// Whether they asked not to be disturbed.
+        quiet: bool,
+        /// What they say they are doing, or nothing.
+        note: Arc<str>,
+    },
+    /// Whether a person is around changed. Only people the channel was asked to
+    /// [watch](Client::watch) are reported.
+    Availability {
+        person: UserId,
+        availability: Availability,
     },
     /// The conversations themselves changed: one was added, left, renamed, muted or hidden.
     ListChanged,
@@ -268,6 +327,8 @@ mod event {
     pub const MESSAGE_POSTED: i32 = 6;
     pub const MESSAGE_UPDATED: i32 = 7;
     pub const MESSAGE_DELETED: i32 = 8;
+    pub const STATUS_UPDATED: i32 = 25;
+    pub const AVAILABILITY_UPDATED: i32 = 45;
     pub const MARKED_UNREAD: i32 = 37;
     pub const READ_STATE_UPDATED: i32 = 83;
     /// Added to or removed from a conversation, a conversation updated, a membership
@@ -366,10 +427,78 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
                     unread: marked,
                 })
             }),
+            event::STATUS_UPDATED => body
+                .user_status
+                .and_then(|updated| updated.user_status)
+                .and_then(|status| {
+                    let person = status.user_id.clone().filter(|id| !id.id.is_empty())?;
+                    let now = (crate::session::now() * 1_000_000.) as i64;
+                    let (quiet, note) = settings(Some(status), now);
+                    Some(Event::Status {
+                        person: UserId(person.id.into()),
+                        quiet,
+                        note,
+                    })
+                }),
+            event::AVAILABILITY_UPDATED => body.availability.and_then(|changed| {
+                let person = changed.user_id.filter(|id| !id.id.is_empty())?;
+                Some(Event::Availability {
+                    person: UserId(person.id.into()),
+                    availability: availability(changed.state)?,
+                })
+            }),
             kind if event::LIST.contains(&kind) => Some(Event::ListChanged),
             _ => None,
         };
     event.unwrap_or(Event::Other(body.kind))
+}
+
+const DO_NOT_DISTURB: i32 = 2;
+
+/// Whether a person is around, from Google's number for it. `None` when Google does not
+/// say.
+fn availability(state: i32) -> Option<Availability> {
+    match state {
+        1 => Some(Availability::Active),
+        2 => Some(Availability::Away),
+        3 => Some(Availability::Idle),
+        _ => None,
+    }
+}
+
+/// What a person's status settings say: whether they are not to be disturbed, and their note.
+fn settings(status: Option<wire::UserStatus>, now: i64) -> (bool, Arc<str>) {
+    let status = status.unwrap_or_default();
+    let quiet = status
+        .dnd_settings
+        .is_some_and(|settings| settings.dnd_state == DO_NOT_DISTURB);
+    let note = status
+        .custom_status
+        .filter(|custom| {
+            custom.state_expiry_timestamp_usec == 0 || custom.state_expiry_timestamp_usec > now
+        })
+        .map(|custom| {
+            let emoji = custom.emoji.unwrap_or_default().unicode;
+            [emoji.as_str(), custom.status_text.trim()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    (quiet, note.into())
+}
+
+/// One person's status as `get_user_presence` reports it, at `now` in microseconds.
+fn status(presence: wire::UserPresence, now: i64) -> Option<(UserId, Status)> {
+    let id = presence.user_id.filter(|id| !id.id.is_empty())?;
+    let (quiet, note) = settings(presence.user_status, now);
+    let status = Status {
+        availability: availability(presence.presence).unwrap_or_default(),
+        quiet: quiet || presence.dnd_state == DO_NOT_DISTURB,
+        note,
+    };
+    Some((UserId(id.id.into()), status))
 }
 
 const NOTICE: i32 = 2;
@@ -635,6 +764,7 @@ mod tests {
                 User {
                     name: name.into(),
                     email: email.into(),
+                    photo: "".into(),
                 },
             );
         }
@@ -691,6 +821,7 @@ mod tests {
             User {
                 name: "Ada".into(),
                 email: "ada@example.com".into(),
+                photo: "//lh3.googleusercontent.com/a/photo".into(),
             },
         );
         snapshot.directory.conversations.push(Conversation {
@@ -952,6 +1083,122 @@ mod tests {
                 Event::ListChanged,
                 Event::Other(29),
                 Event::Other(event::MESSAGE_POSTED),
+            ]
+        );
+    }
+
+    fn custom(text: &str, emoji: &str, expires: i64) -> wire::UserStatus {
+        wire::UserStatus {
+            user_id: Some(user_id("ada")),
+            dnd_settings: None,
+            custom_status: Some(wire::CustomStatus {
+                status_text: text.into(),
+                state_expiry_timestamp_usec: expires,
+                emoji: Some(wire::Emoji {
+                    unicode: emoji.into(),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_status_says_whether_someone_is_around_or_not_to_be_disturbed() {
+        let presence = |presence, dnd_state, user_status| wire::UserPresence {
+            user_id: Some(user_id("ada")),
+            presence,
+            dnd_state,
+            user_status,
+        };
+        let read = |presence| status(presence, 100).unwrap().1;
+
+        let shown = |raw| read(presence(raw, 1, None)).presence();
+        assert_eq!(shown(1), Presence::Active);
+        assert_eq!(shown(3), Presence::Idle);
+        for away in [0, 2, 4] {
+            assert_eq!(shown(away), Presence::Away);
+        }
+        assert_eq!(
+            read(presence(1, DO_NOT_DISTURB, None)).presence(),
+            Presence::DoNotDisturb
+        );
+        let mut quiet = custom("", "", 0);
+        quiet.dnd_settings = Some(wire::DndSettings {
+            dnd_state: DO_NOT_DISTURB,
+        });
+        let quiet = read(presence(1, 0, Some(quiet)));
+        assert_eq!(
+            (quiet.presence(), quiet.availability),
+            (Presence::DoNotDisturb, Availability::Active),
+            "their settings say so too, and they are still around"
+        );
+
+        let note = |status| read(presence(1, 1, Some(status))).note;
+        assert_eq!(&*note(custom(" In a meeting ", "📅", 0)), "📅 In a meeting");
+        assert_eq!(&*note(custom("Lunch", "", 101)), "Lunch");
+        assert_eq!(&*note(custom("Lunch", "🍜", 99)), "", "it has run out");
+
+        let mut nameless = presence(1, 1, None);
+        nameless.user_id = None;
+        assert_eq!(status(nameless, 100), None);
+    }
+
+    #[test]
+    fn a_report_says_who_came_or_went() {
+        let changed = |state| wire::EventBody {
+            availability: Some(wire::Availability {
+                user_id: Some(user_id("ada")),
+                state,
+            }),
+            ..body(event::AVAILABILITY_UPDATED)
+        };
+        let report = wire::Event {
+            bodies: vec![changed(1), changed(2), changed(3), changed(0)],
+            ..Default::default()
+        };
+
+        let came_or_went = |availability| Event::Availability {
+            person: UserId("ada".into()),
+            availability,
+        };
+        assert_eq!(
+            events(report),
+            [
+                came_or_went(Availability::Active),
+                came_or_went(Availability::Away),
+                came_or_went(Availability::Idle),
+                Event::Other(event::AVAILABILITY_UPDATED),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_report_carries_a_persons_changed_status() {
+        let mut settings = custom("Focusing", "", 0);
+        settings.dnd_settings = Some(wire::DndSettings {
+            dnd_state: DO_NOT_DISTURB,
+        });
+        let report = wire::Event {
+            bodies: vec![
+                wire::EventBody {
+                    user_status: Some(wire::UserStatusUpdated {
+                        user_status: Some(settings),
+                    }),
+                    ..body(event::STATUS_UPDATED)
+                },
+                body(event::STATUS_UPDATED),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            events(report),
+            [
+                Event::Status {
+                    person: UserId("ada".into()),
+                    quiet: true,
+                    note: "Focusing".into(),
+                },
+                Event::Other(event::STATUS_UPDATED),
             ]
         );
     }

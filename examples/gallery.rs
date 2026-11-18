@@ -10,6 +10,7 @@ use gpui::{
     SharedString, Window, div, prelude::*,
 };
 use peep::{
+    chat::Presence,
     theme::{self, ActiveTheme, Mode, Theme},
     ui::{
         self, Avatar, Badge, Button, ButtonVariant, Checkbox, Color, ControlSize, Divider,
@@ -572,10 +573,24 @@ fn avatars_and_badges(theme: &Theme) -> Div {
         ("Large", ControlSize::Large),
     ]
     .map(|(name, size)| captioned(name, Avatar::new("Ada Lovelace").size(size), theme));
+    let presences = [
+        ("Active", Presence::Active),
+        ("Idle", Presence::Idle),
+        ("Away", Presence::Away),
+        ("Do not disturb", Presence::DoNotDisturb),
+    ]
+    .map(|(name, presence)| {
+        captioned(
+            name,
+            Avatar::new("Grace Hopper").presence(Some(presence)),
+            theme,
+        )
+    });
     let badges = ["2", "12", "99+"].map(Badge::new);
 
     section("Avatar and badge", theme)
         .child(group("Avatar", theme).child(row(theme).items_end().children(avatars)))
+        .child(group("Presence", theme).child(row(theme).items_end().children(presences)))
         .child(group("Badge", theme).child(row(theme).gap(theme.spacing.sm).children(badges)))
 }
 

@@ -116,12 +116,17 @@ impl Main {
         })
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
-                this.account
-                    .update(cx, |account, cx| account.refresh_if_stale(cx));
-            }
+            let active = window.is_window_active();
+            this.account.update(cx, |account, cx| {
+                account.set_frontmost(active, cx);
+                if active {
+                    account.refresh_if_stale(cx);
+                }
+            });
         })
         .detach();
+        let active = window.is_window_active();
+        account.update(cx, |account, cx| account.set_frontmost(active, cx));
         Self {
             account,
             conversations,
