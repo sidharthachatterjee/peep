@@ -1,7 +1,10 @@
 //! Google Chat: the people, direct messages and messages of the signed-in account.
 
 mod client;
+#[cfg(test)]
+pub(crate) mod fake;
 mod live;
+mod service;
 mod wire;
 
 use std::{collections::HashMap, sync::Arc};
@@ -9,6 +12,7 @@ use std::{collections::HashMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 pub use client::{Client, Error};
+pub use service::{Answer, Service};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UserId(pub Arc<str>);

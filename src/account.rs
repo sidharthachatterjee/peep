@@ -5,6 +5,7 @@ mod timeline;
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -16,7 +17,7 @@ use crate::{
     cache,
     chat::{
         self, Client, ConversationId, Directory, Event, Message, MessageKind, Page, Presence,
-        Showing, Snapshot, Status as PersonStatus, UserId,
+        Service, Showing, Snapshot, Status as PersonStatus, UserId,
     },
     photos,
     session::{self, Session, SignIn},
@@ -120,11 +121,12 @@ pub struct Account {
     settings_task: Option<Task<()>>,
     /// When their settings were last asked for.
     settings_asked: Option<Instant>,
-    /// False for an account made with [`Account::with`], which never starts Chrome.
+    /// False for an account made for a test or a preview, which starts no Chrome and keeps
+    /// no files.
     live: bool,
     /// What the last launch kept, until a client takes it over.
     kept: Snapshot,
-    client: Option<Client>,
+    client: Option<Rc<dyn Service>>,
     /// Whether the live channel is up, bringing changes as they happen.
     connected: bool,
     /// When the list was last asked for.
@@ -190,6 +192,14 @@ impl Account {
             live_task: None,
             settle_task: None,
         }
+    }
+
+    /// An account whose Google Chat is `service`, already signed in.
+    #[cfg(test)]
+    pub(crate) fn over(service: Rc<dyn Service>, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::with(Status::Starting, Vec::new());
+        this.attach(service, cx);
+        this
     }
 
     /// Gives a test account direct messages with these ids, each with one person.
@@ -557,7 +567,7 @@ impl Account {
     }
 
     /// The client and the id to ask it about a conversation with.
-    fn reach(&self, conversation: &SharedString) -> Option<(Client, ConversationId)> {
+    fn reach(&self, conversation: &SharedString) -> Option<(Rc<dyn Service>, ConversationId)> {
         let id = self
             .directory
             .conversations
@@ -642,20 +652,23 @@ impl Account {
 
     fn connect(&mut self, session: Session, cx: &mut Context<Self>) {
         match Client::new(session, std::mem::take(&mut self.kept)) {
-            Ok(client) => {
-                let mut events = client.events();
-                self.live_task = Some(cx.spawn(async move |this, cx| {
-                    while let Some(event) = events.next().await {
-                        if this.update(cx, |this, cx| this.heard(event, cx)).is_err() {
-                            break;
-                        }
-                    }
-                }));
-                self.client = Some(client);
-                self.load(cx);
-            }
+            Ok(client) => self.attach(Rc::new(client), cx),
             Err(error) => self.set_status(Status::Failed(error.to_string().into()), cx),
         }
+    }
+
+    /// Starts using `service`: listens to its live channel and loads the list.
+    fn attach(&mut self, service: Rc<dyn Service>, cx: &mut Context<Self>) {
+        let mut events = service.events();
+        self.live_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next().await {
+                if this.update(cx, |this, cx| this.heard(event, cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+        self.client = Some(service);
+        self.load(cx);
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -691,14 +704,16 @@ impl Account {
                 for conversation in recent {
                     self.open(&conversation, cx);
                 }
-                cx.background_spawn(async move {
-                    if let Some(folder) = cache::folder()
-                        && let Err(error) = cache::write(&folder, &snapshot)
-                    {
-                        eprintln!("Peep could not keep its snapshot: {error}");
-                    }
-                })
-                .detach();
+                if self.live {
+                    cx.background_spawn(async move {
+                        if let Some(folder) = cache::folder()
+                            && let Err(error) = cache::write(&folder, &snapshot)
+                        {
+                            eprintln!("Peep could not keep its snapshot: {error}");
+                        }
+                    })
+                    .detach();
+                }
             }
             Err(chat::Error::SignedOut) => self.signed_out(cx),
             // A failed refresh leaves what is already showing in place.
@@ -875,15 +890,17 @@ impl Account {
         self.watch_task = None;
         self.settings_task = None;
         self.set_status(Status::SignedOut, cx);
-        cx.background_spawn(async {
-            photos::forget();
-            if let Some(folder) = cache::folder()
-                && let Err(error) = cache::clear(&folder)
-            {
-                eprintln!("Peep could not forget its snapshot: {error}");
-            }
-        })
-        .detach();
+        if self.live {
+            cx.background_spawn(async {
+                photos::forget();
+                if let Some(folder) = cache::folder()
+                    && let Err(error) = cache::clear(&folder)
+                {
+                    eprintln!("Peep could not forget its snapshot: {error}");
+                }
+            })
+            .detach();
+        }
     }
 
     fn set_status(&mut self, status: Status, cx: &mut Context<Self>) {

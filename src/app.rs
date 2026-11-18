@@ -1,6 +1,8 @@
 //! The application: its menu, its key bindings and its main window.
 
 mod conversations;
+#[cfg(test)]
+mod end_to_end;
 mod messages;
 
 use futures::{StreamExt as _, channel::mpsc};
@@ -65,22 +67,29 @@ pub fn run() {
     app.run(move |cx| {
         init(cx);
         let account = cx.new(Account::new);
-        cx.set_global(SignedIn(account.clone()));
-        show_in_menu_bar(&account, cx);
-        show_on_icon(&account, cx);
-        // With its window closed Peep stays in the menu bar, and does only what that needs.
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                let account = cx.global::<SignedIn>().0.clone();
-                account.update(cx, |account, cx| account.rest(cx));
-            }
-        })
-        .detach();
-        if !in_background {
-            open_window(cx);
-            cx.activate(true);
-        }
+        launch(account, !in_background, cx);
     });
+}
+
+/// Starts Peep for `account`: in the menu bar and the Dock, and with its window open in
+/// front of other apps if `in_front`.
+fn launch(account: Entity<Account>, in_front: bool, cx: &mut App) {
+    cx.set_global(SignedIn(account.clone()));
+    cx.set_global(NotificationsPaused::default());
+    show_in_menu_bar(&account, cx);
+    show_on_icon(&account, cx);
+    // With its window closed Peep stays in the menu bar, and does only what that needs.
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            let account = cx.global::<SignedIn>().0.clone();
+            account.update(cx, |account, cx| account.rest(cx));
+        }
+    })
+    .detach();
+    if in_front {
+        open_window(cx);
+        cx.activate(true);
+    }
 }
 
 /// Keeps the count of what is unread on Peep's icon in the Dock and the app switcher.
@@ -108,7 +117,6 @@ fn show_in_menu_bar(account: &Entity<Account>, cx: &mut App) {
         return;
     };
     cx.set_global(InMenuBar(item));
-    cx.set_global(NotificationsPaused::default());
     update_menu_bar(cx);
     cx.observe(account, |_, cx| update_menu_bar(cx)).detach();
     cx.observe_global::<NotificationsPaused>(update_menu_bar)
@@ -123,8 +131,13 @@ fn show_in_menu_bar(account: &Entity<Account>, cx: &mut App) {
 
 /// Shows the account as it is now in the menu bar.
 fn update_menu_bar(cx: &mut App) {
+    cx.global::<InMenuBar>().0.show(menu_bar_content(cx));
+}
+
+/// What the menu bar shows for the account as it is now.
+fn menu_bar_content(cx: &App) -> Content {
     let account = cx.global::<SignedIn>().0.read(cx);
-    let content = Content {
+    Content {
         showing: account.showing(),
         paused: cx.global::<NotificationsPaused>().0,
         unread: account.unread(),
@@ -132,8 +145,7 @@ fn update_menu_bar(cx: &mut App) {
             .unread_rows(UNREAD_IN_MENU)
             .map(|row| (row.id.to_string(), row.title.to_string()))
             .collect(),
-    };
-    cx.global::<InMenuBar>().0.show(content);
+    }
 }
 
 /// Does what was chosen from the menu bar's menu.
