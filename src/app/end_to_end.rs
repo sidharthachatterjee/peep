@@ -535,3 +535,92 @@ fn what_is_being_written_is_kept_for_each_conversation(cx: &mut TestAppContext) 
     open("dm/grace-dm", cx);
     assert_eq!(composer(cx).0, "to Grace");
 }
+
+/// Does something in the app whether or not its window is open.
+fn in_app<R>(cx: &mut TestAppContext, change: impl FnOnce(&mut App) -> R) -> R {
+    cx.update(change)
+}
+
+/// What each message that arrived came to: nothing, the sound, or a banner's title, body
+/// and whether it had the sound.
+fn notified(cx: &mut TestAppContext) -> Vec<String> {
+    cx.update(|cx| {
+        let notified = std::mem::take(&mut cx.global_mut::<notify::Notifier>().notified);
+        notified
+            .into_iter()
+            .map(|notify| match notify {
+                notify::Notify::Nothing => "nothing".to_owned(),
+                notify::Notify::Sound => "sound".to_owned(),
+                notify::Notify::Banner(notice) => {
+                    let sound = if notice.sound { "with sound" } else { "silent" };
+                    format!("{}: {} ({sound})", notice.title, notice.body)
+                }
+            })
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn a_message_brings_a_banner_only_when_peep_is_not_showing_it(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (_, cx) = start(&service, cx);
+    cx.simulate_keystrokes("tab down");
+    settle(cx);
+
+    service.post("dm/ada-dm", "ada", "Ready now.");
+    service.post("dm/grace-dm", "grace", "Six");
+    service.post("dm/grace-dm", "me", "Seven, from my phone");
+    settle(cx);
+    assert_eq!(
+        notified(cx),
+        ["nothing", "sound"],
+        "in front: nothing for the open conversation, the sound for another, and never \
+         anything for my own messages"
+    );
+
+    cx.simulate_keystrokes("cmd-w");
+    settle(cx);
+    service.post("dm/ada-dm", "ada", "Shall I start it?");
+    service.post("dm/ada-dm", "ada", "Starting.");
+    settle(cx);
+    assert_eq!(
+        notified(cx),
+        [
+            "Ada: Shall I start it? (with sound)",
+            "Ada: Starting. (silent)"
+        ],
+        "with the window closed: a banner each, chirping once"
+    );
+}
+
+#[gpui::test]
+fn pausing_and_do_not_disturb_keep_banners_away(cx: &mut TestAppContext) {
+    let service = two_people().mute("dm/grace-dm");
+    let (_, cx) = start(&service, cx);
+    cx.simulate_keystrokes("cmd-w");
+    settle(cx);
+
+    service.post("dm/grace-dm", "grace", "Six");
+    settle(cx);
+    assert_eq!(notified(cx), [] as [&str; 0], "a muted conversation");
+
+    in_app(cx, |cx| carry_out(Command::Pause(true), cx));
+    service.post("dm/ada-dm", "ada", "One");
+    settle(cx);
+    in_app(cx, |cx| carry_out(Command::Pause(false), cx));
+    let until_later = Choice::DoNotDisturbFor(Duration::from_secs(1800));
+    in_app(cx, |cx| carry_out(Command::Show(until_later), cx));
+    settle(cx);
+    service.post("dm/ada-dm", "ada", "Two");
+    settle(cx);
+    in_app(cx, |cx| carry_out(Command::Show(Choice::Automatic), cx));
+    settle(cx);
+    service.post("dm/ada-dm", "ada", "Three");
+    settle(cx);
+
+    assert_eq!(
+        notified(cx),
+        ["nothing", "nothing", "Ada: Three (with sound)"],
+        "paused, then not to be disturbed, then neither"
+    );
+}

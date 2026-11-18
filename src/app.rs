@@ -5,6 +5,7 @@ mod conversations;
 #[cfg(test)]
 mod end_to_end;
 mod messages;
+mod notify;
 #[cfg(test)]
 mod pictures;
 
@@ -39,7 +40,7 @@ struct InMenuBar(MenuBarItem);
 
 impl Global for InMenuBar {}
 
-/// Whether notifications are paused. Peep has none yet, so for now this only shows.
+/// Whether notifications are paused.
 #[derive(Default)]
 struct NotificationsPaused(bool);
 
@@ -84,6 +85,7 @@ fn launch(account: Entity<Account>, in_front: bool, cx: &mut App) {
     cx.set_global(NotificationsPaused::default());
     show_in_menu_bar(&account, cx);
     show_on_icon(&account, cx);
+    notify::start(&account, cx);
     // With its window closed Peep stays in the menu bar, and does only what that needs.
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
@@ -279,6 +281,8 @@ struct Main {
     account: Entity<Account>,
     conversations: Entity<Conversations>,
     messages: Entity<Messages>,
+    /// Whether the window is the one the person is typing in, in front of other apps.
+    in_front: bool,
 }
 
 impl Main {
@@ -299,6 +303,7 @@ impl Main {
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             let active = window.is_window_active();
+            this.in_front = active;
             this.account.update(cx, |account, cx| {
                 account.set_frontmost(active, cx);
                 if active {
@@ -313,6 +318,7 @@ impl Main {
             account,
             conversations,
             messages,
+            in_front: active,
         }
     }
 }

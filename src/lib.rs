@@ -7,6 +7,7 @@ pub mod chat;
 mod dock;
 pub mod menu_bar;
 mod network;
+mod notifications;
 pub mod photos;
 pub mod session;
 pub mod theme;

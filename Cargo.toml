@@ -13,12 +13,14 @@ gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed", rev =
 # Runtime compilation keeps development builds compatible with Command Line Tools alone.
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e944cfa2fe622a7a15041b9dfc7770933792857c", default-features = false, features = ["font-kit", "runtime_shaders"] }
 base64 = "0.22"
+block2 = "0.6"
 futures = "0.3"
 image = "0.25"
 libc = "0.2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSButton", "NSCell", "NSControl", "NSDockTile", "NSFont", "NSFontDescriptor", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "objc2-core-foundation"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSButton", "NSCell", "NSControl", "NSDockTile", "NSFont", "NSFontDescriptor", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSSound", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSError", "NSGeometry", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "gzip", "brotli"] }
 serde = { version = "1", features = ["derive", "rc"] }
