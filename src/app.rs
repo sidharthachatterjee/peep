@@ -13,6 +13,7 @@ use self::{conversations::Conversations, messages::Messages};
 use crate::{
     account::{Account, Status},
     chat::Showing,
+    dock,
     menu_bar::{Choice, Command, Content, MenuBarItem},
     session,
     theme::ActiveTheme,
@@ -61,6 +62,7 @@ pub fn run() {
         let account = cx.new(Account::new);
         cx.set_global(SignedIn(account.clone()));
         show_in_menu_bar(&account, cx);
+        show_on_icon(&account, cx);
         // With its window closed Peep stays in the menu bar, and does only what that needs.
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -72,6 +74,20 @@ pub fn run() {
         open_window(cx);
         cx.activate(true);
     });
+}
+
+/// Keeps the count of what is unread on Peep's icon in the Dock and the app switcher.
+fn show_on_icon(account: &Entity<Account>, cx: &mut App) {
+    let mut shown = account.read(cx).unread();
+    dock::show_unread(shown);
+    cx.observe(account, move |account, cx| {
+        let unread = account.read(cx).unread();
+        if unread != shown {
+            shown = unread;
+            dock::show_unread(unread);
+        }
+    })
+    .detach();
 }
 
 /// Puts Peep's icon in the menu bar, with the count of what is unread beside it and a menu
