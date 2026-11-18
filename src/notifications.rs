@@ -109,7 +109,9 @@ pub fn chirp() {
     }
 }
 
-/// Asks the person, the first time, whether Peep may show banners.
+/// Asks the person, the first time, whether Peep may show banners. The count on Peep's Dock
+/// icon is asked for with them: once an app asks to notify, macOS hides a count it did not
+/// ask for.
 fn ask_leave(center: &UNUserNotificationCenter) {
     let answered = RcBlock::new(|_granted: Bool, error: *mut NSError| {
         // SAFETY: when it is not null, `error` is a valid error for as long as this runs.
@@ -121,7 +123,9 @@ fn ask_leave(center: &UNUserNotificationCenter) {
         }
     });
     center.requestAuthorizationWithOptions_completionHandler(
-        UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+        UNAuthorizationOptions::Alert
+            | UNAuthorizationOptions::Sound
+            | UNAuthorizationOptions::Badge,
         &answered,
     );
 }
