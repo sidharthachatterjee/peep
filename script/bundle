@@ -13,8 +13,10 @@ app="$root/target/Peep.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/peep "$app/Contents/MacOS/peep"
-# The sound a message arrives with.
-cp assets/sounds/Peep.caf "$app/Contents/Resources/Peep.caf"
+# The sound a message arrives with, once one is chosen. Without it macOS plays its own.
+if [ -f assets/sounds/Peep.caf ]; then
+    cp assets/sounds/Peep.caf "$app/Contents/Resources/Peep.caf"
+fi
 
 # The layered icon becomes Assets.car, which current macOS renders in each appearance,
 # plus AppIcon.icns for versions before that.
