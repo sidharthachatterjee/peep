@@ -114,9 +114,19 @@ impl Fake {
                 .directory
                 .conversations
                 .sort_by_key(|conversation| std::cmp::Reverse(conversation.sort_time));
-            state.directory.unread += u32::from(unread > 0);
             state.messages.insert(id.key(), messages);
         }
+        self
+    }
+
+    /// Mutes the conversation with this key.
+    pub(crate) fn mute(self, conversation: &str) -> Self {
+        let mut state = self.0.borrow_mut();
+        let known = state.directory.conversations.iter_mut();
+        for known in known.filter(|known| known.id.has_key(conversation)) {
+            known.muted = true;
+        }
+        drop(state);
         self
     }
 
@@ -216,26 +226,21 @@ impl Service for Fake {
 
     fn mark_read(&self, conversation: &ConversationId, time: i64) -> Answer<()> {
         let id = conversation.clone();
-        let mut count = None;
+        let mut was_unread = false;
         let answer = self.answer(Asked::MarkRead(id.key(), time), |state| {
-            let unread = state
+            let known = state
                 .directory
                 .conversations
                 .iter_mut()
-                .find(|known| known.id == id)
-                .map(|known| std::mem::take(&mut known.unread));
-            if unread.is_some_and(|unread| unread > 0) {
-                state.directory.unread -= 1;
-                count = Some(state.directory.unread);
-            }
+                .find(|known| known.id == id);
+            was_unread = known.is_some_and(|known| std::mem::take(&mut known.unread) > 0);
         });
-        // Every device hears that it was read, and the count that leaves.
-        if let Some(count) = count {
+        // Every device hears that it was read.
+        if was_unread {
             self.say(Event::Read {
                 conversation: conversation.clone(),
                 unread: false,
             });
-            self.say(Event::Unread(count));
         }
         answer
     }

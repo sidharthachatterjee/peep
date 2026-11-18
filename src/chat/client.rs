@@ -13,9 +13,8 @@ use tokio::{
 };
 
 use super::{
-    Conversation, ConversationId, Directory, Event, Page, Showing, Snapshot, Status, Token,
-    UNREAD_IN_HOME, User, UserId, conversation, live::Registration, page, status, unread_in_home,
-    wire,
+    Conversation, ConversationId, Directory, Event, Page, Showing, Snapshot, Status, Token, User,
+    UserId, conversation, live::Registration, page, status, wire,
 };
 use crate::{
     network,
@@ -45,8 +44,6 @@ const PEOPLE_PER_REQUEST: usize = 100;
 /// same time by leaving people out: asked about 500 at once, it reported a fifth of those
 /// who were active.
 const STATUSES_PER_REQUEST: usize = 50;
-/// Google's number for its Home view.
-const HOME: i32 = 1;
 /// A guard against a server that never stops paging.
 const MAX_PAGES: usize = 50;
 /// How long a request token is used before a fresh one is fetched, in seconds. Google
@@ -304,8 +301,7 @@ fn group_id(conversation: &ConversationId) -> wire::GroupId {
 
 impl Inner {
     async fn refresh(&self) -> Result<Snapshot, Error> {
-        let ((me, showing), items, unread) =
-            futures::try_join!(self.me(), self.world(), self.unread())?;
+        let ((me, showing), items) = futures::try_join!(self.me(), self.world())?;
 
         let mut conversations: Vec<Conversation> = Vec::new();
         for item in items {
@@ -346,7 +342,6 @@ impl Inner {
         let mut directory = Directory {
             me: Some(me),
             showing,
-            unread,
             users: users.clone(),
             conversations,
         };
@@ -383,11 +378,9 @@ impl Inner {
                 world_section_requests: vec![wire::WorldSectionRequest {
                     page_size: PAGE_SIZE,
                     pagination_token: page.clone(),
-                    ..Default::default()
                 }],
                 fetch_from_user_spaces: true,
                 fetch_snippets_for_unnamed_rooms: true,
-                badge_count_types: Vec::new(),
             };
             let response: wire::PaginatedWorldResponse =
                 self.call("paginated_world", &request).await?;
@@ -406,28 +399,6 @@ impl Inner {
             }
         }
         Ok(items)
-    }
-
-    /// How much is unread, by Google Chat's own count: what its Home view counts across
-    /// direct messages, spaces and followed threads.
-    async fn unread(&self) -> Result<u32, Error> {
-        const METHOD: &str = "paginated_world";
-        let request = wire::PaginatedWorldRequest {
-            request_header: wire::request_header(),
-            // The count comes only with a section of the Home view; one item of it will do.
-            world_section_requests: vec![wire::WorldSectionRequest {
-                page_size: 1,
-                pagination_token: String::new(),
-                sort_key: Some(wire::WorldSortKey { sort: HOME }),
-                view: Some(wire::WorldView { view: HOME }),
-            }],
-            fetch_from_user_spaces: false,
-            fetch_snippets_for_unnamed_rooms: false,
-            badge_count_types: vec![UNREAD_IN_HOME],
-        };
-        let response: wire::PaginatedWorldResponse = self.call(METHOD, &request).await?;
-        // Google leaves the count out when it is nothing.
-        Ok(unread_in_home(&response.badge_counts).unwrap_or(0))
     }
 
     async fn users(&self, ids: &[&UserId]) -> Result<HashMap<UserId, User>, Error> {

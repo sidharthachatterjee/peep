@@ -93,8 +93,6 @@ pub struct TimelineChanged {
 pub struct Account {
     status: Status,
     rows: Vec<Row>,
-    /// How much is unread across everything, by Google Chat's own count.
-    unread: u32,
     /// What the signed-in person chose to show others.
     showing: Showing,
     /// Wakes when do not disturb ends by itself, to say so.
@@ -154,7 +152,6 @@ impl Account {
             Status::Ready
         };
         let mut this = Self::with(status, rows);
-        this.unread = kept.directory.unread;
         this.set_showing(kept.directory.showing, cx);
         this.directory = kept.directory.clone();
         this.kept = kept;
@@ -168,7 +165,6 @@ impl Account {
         Self {
             status,
             rows,
-            unread: 0,
             showing: Showing::Automatic,
             showing_task: None,
             directory: Directory::default(),
@@ -226,10 +222,10 @@ impl Account {
         &self.status
     }
 
-    /// How much is unread across direct messages, spaces and followed threads, as Google
-    /// Chat itself counts it.
+    /// How many conversations have something unread, leaving out muted ones. Google Chat's
+    /// own total is not used: it counts conversations that were read long ago.
     pub fn unread(&self) -> u32 {
-        self.unread
+        u32::try_from(self.unread_rows(usize::MAX).count()).unwrap_or(u32::MAX)
     }
 
     /// What the signed-in person is showing others right now.
@@ -279,11 +275,12 @@ impl Account {
         }
     }
 
-    /// Up to `most` conversations with something unread, most recently active first.
+    /// Up to `most` conversations with something unread, most recently active first. Muted
+    /// ones are left out.
     pub fn unread_rows(&self, most: usize) -> impl Iterator<Item = &Row> {
         self.rows
             .iter()
-            .filter(|row| row.unread.is_some())
+            .filter(|row| row.unread.is_some() && !row.muted)
             .take(most)
     }
 
@@ -688,7 +685,6 @@ impl Account {
         match result {
             Ok(snapshot) => {
                 self.rows = rows(&snapshot.directory, &self.statuses);
-                self.unread = snapshot.directory.unread;
                 self.set_showing(snapshot.directory.showing, cx);
                 self.directory = snapshot.directory.clone();
                 self.set_status(Status::Ready, cx);
@@ -811,12 +807,6 @@ impl Account {
                 self.reported.insert(person);
                 self.statuses_changed(cx);
             }
-            Event::Unread(unread) => {
-                if self.unread != unread {
-                    self.unread = unread;
-                    cx.notify();
-                }
-            }
             Event::ListChanged => self.reload_soon(cx),
             Event::Other(_) => {}
         }
@@ -880,7 +870,6 @@ impl Account {
         self.connected = false;
         self.kept = Snapshot::default();
         self.rows.clear();
-        self.unread = 0;
         self.set_showing(Showing::Automatic, cx);
         self.directory = Directory::default();
         self.timelines.clear();
@@ -1043,7 +1032,6 @@ mod tests {
         Directory {
             me: Some(UserId("me".into())),
             showing: chat::Showing::Automatic,
-            unread: 0,
             conversations: vec![
                 conversation(ConversationId::Dm("a".into()), &["ada"], 3),
                 conversation(ConversationId::Space("s".into()), &["ada", "grace"], 2),

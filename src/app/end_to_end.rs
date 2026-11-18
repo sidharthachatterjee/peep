@@ -262,14 +262,45 @@ fn an_unread_conversation_opens_from_the_menu_bar(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn googles_own_count_shows_in_the_menu_bar_as_it_changes(cx: &mut TestAppContext) {
-    let service = two_people();
-    let (_, cx) = start(&service, cx);
+fn the_count_is_of_unread_conversations_that_are_not_muted(cx: &mut TestAppContext) {
+    let service = two_people()
+        .conversation("Linus", &[("linus", "Ping"), ("linus", "Ping")], 5, 0)
+        .mute("dm/linus-dm");
+    let (account, cx) = start(&service, cx);
+    let in_menu_bar = |cx: &mut VisualTestContext| {
+        let content = cx.update(|_, cx| menu_bar_content(cx));
+        let names: Vec<String> = content
+            .conversations
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        (content.unread, names)
+    };
 
-    service.say(Event::Unread(7));
+    assert_eq!(
+        list(&account, cx),
+        [
+            row("Ada", Some("1")),
+            row("Linus", Some("2")),
+            row("Grace", None)
+        ]
+    );
+    assert_eq!(in_menu_bar(cx), (1, vec!["Ada".to_owned()]));
+
+    service.post("dm/grace-dm", "grace", "Six");
     settle(cx);
+    assert_eq!(
+        in_menu_bar(cx),
+        (2, vec!["Grace".to_owned(), "Ada".to_owned()])
+    );
 
-    assert_eq!(cx.update(|_, cx| menu_bar_content(cx)).unread, 7);
+    // Ada is read on another device.
+    service.say(Event::Read {
+        conversation: ConversationId::Dm("ada-dm".into()),
+        unread: false,
+    });
+    settle(cx);
+    assert_eq!(in_menu_bar(cx), (1, vec!["Grace".to_owned()]));
 }
 
 #[gpui::test]

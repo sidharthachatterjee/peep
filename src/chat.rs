@@ -159,8 +159,6 @@ pub struct Directory {
     pub me: Option<UserId>,
     /// What they chose to show others.
     pub showing: Showing,
-    /// How much is unread across everything, by Google Chat's own count.
-    pub unread: u32,
     /// Direct messages, most recently active first.
     pub conversations: Vec<Conversation>,
     pub users: HashMap<UserId, User>,
@@ -246,8 +244,6 @@ pub enum Event {
         person: UserId,
         availability: Availability,
     },
-    /// How much is unread across everything changed, by Google Chat's own count.
-    Unread(u32),
     /// The conversations themselves changed: one was added, left, renamed, muted or hidden.
     ListChanged,
     /// Anything else, by Google's number for it.
@@ -377,7 +373,6 @@ mod event {
     pub const MESSAGE_DELETED: i32 = 8;
     pub const STATUS_UPDATED: i32 = 25;
     pub const AVAILABILITY_UPDATED: i32 = 45;
-    pub const UNREAD_UPDATED: i32 = 75;
     pub const MARKED_UNREAD: i32 = 37;
     pub const READ_STATE_UPDATED: i32 = 83;
     /// Added to or removed from a conversation, a conversation updated, a membership
@@ -498,10 +493,6 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
                     availability: availability(changed.state)?,
                 })
             }),
-            event::UNREAD_UPDATED => body
-                .badge_counts
-                .and_then(|counts| unread_in_home(&counts.badge_counts))
-                .map(Event::Unread),
             kind if event::LIST.contains(&kind) => Some(Event::ListChanged),
             _ => None,
         };
@@ -509,17 +500,6 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
 }
 
 const DO_NOT_DISTURB: i32 = 2;
-/// Google's number for the count of what its Home view shows as unread.
-const UNREAD_IN_HOME: i32 = 1;
-
-/// What the Home view counts as unread, among the counts Google sent.
-fn unread_in_home(counts: &[wire::BadgeCount]) -> Option<u32> {
-    counts
-        .iter()
-        .find(|count| count.kind == UNREAD_IN_HOME)
-        .map(|count| u32::try_from(count.count).unwrap_or(0))
-}
-
 /// Whether a person is around, from Google's number for it. `None` when Google does not
 /// say.
 fn availability(state: i32) -> Option<Availability> {
@@ -1269,40 +1249,6 @@ mod tests {
                 },
                 Event::Other(event::STATUS_UPDATED),
             ]
-        );
-    }
-
-    #[test]
-    fn a_report_carries_googles_own_unread_count() {
-        let counts = |counts: &[(i32, i32)]| wire::EventBody {
-            badge_counts: Some(wire::BadgeCountUpdated {
-                badge_counts: counts
-                    .iter()
-                    .map(|(kind, count)| wire::BadgeCount {
-                        kind: *kind,
-                        count: *count,
-                    })
-                    .collect(),
-            }),
-            ..body(event::UNREAD_UPDATED)
-        };
-        let report = wire::Event {
-            bodies: vec![
-                counts(&[(2, 4), (1, 15)]),
-                counts(&[(2, 4)]),
-                counts(&[(1, -3)]),
-            ],
-            ..Default::default()
-        };
-
-        assert_eq!(
-            events(report),
-            [
-                Event::Unread(15),
-                Event::Other(event::UNREAD_UPDATED),
-                Event::Unread(0),
-            ],
-            "only the Home count is used"
         );
     }
 

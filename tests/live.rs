@@ -38,11 +38,12 @@ fn refreshed(client: &Client) -> Snapshot {
 fn the_list_loads_with_the_people_in_it() {
     let directory = refreshed(&client()).directory;
 
+    let unread = directory.conversations.iter().filter(|c| c.unread > 0);
     println!(
-        "{} conversations, {} people, {} unread by Google's count",
+        "{} conversations, {} people, {} with something unread",
         directory.conversations.len(),
         directory.users.len(),
-        directory.unread
+        unread.count()
     );
     assert!(directory.me.is_some());
     assert!(!directory.conversations.is_empty());

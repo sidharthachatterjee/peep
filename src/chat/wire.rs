@@ -193,9 +193,6 @@ pub struct PaginatedWorldRequest {
     pub fetch_from_user_spaces: bool,
     #[prost(bool, tag = "7")]
     pub fetch_snippets_for_unnamed_rooms: bool,
-    /// The unread totals to send back. They come only with a section of the Home view.
-    #[prost(int32, repeated, tag = "10")]
-    pub badge_count_types: Vec<i32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -204,24 +201,6 @@ pub struct WorldSectionRequest {
     pub page_size: i32,
     #[prost(string, tag = "6")]
     pub pagination_token: String,
-    #[prost(message, optional, tag = "11")]
-    pub sort_key: Option<WorldSortKey>,
-    #[prost(message, optional, tag = "15")]
-    pub view: Option<WorldView>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct WorldSortKey {
-    /// 1 is the order of the Home view.
-    #[prost(int32, tag = "1")]
-    pub sort: i32,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct WorldView {
-    /// 1 is the Home view.
-    #[prost(int32, tag = "1")]
-    pub view: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -230,24 +209,6 @@ pub struct PaginatedWorldResponse {
     pub world_section_responses: Vec<WorldSectionResponse>,
     #[prost(message, repeated, tag = "4")]
     pub world_items: Vec<WorldItem>,
-    #[prost(message, repeated, tag = "8")]
-    pub badge_counts: Vec<BadgeCount>,
-}
-
-/// One of Google Chat's own unread totals.
-#[derive(Clone, PartialEq, Message)]
-pub struct BadgeCount {
-    /// 1 is what the Home view counts as unread.
-    #[prost(int32, tag = "1")]
-    pub kind: i32,
-    #[prost(int32, tag = "2")]
-    pub count: i32,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct BadgeCountUpdated {
-    #[prost(message, repeated, tag = "1")]
-    pub badge_counts: Vec<BadgeCount>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -557,8 +518,6 @@ pub struct EventBody {
     pub marked_unread: Option<MarkedUnread>,
     #[prost(message, optional, tag = "38")]
     pub availability: Option<Availability>,
-    #[prost(message, optional, tag = "59")]
-    pub badge_counts: Option<BadgeCountUpdated>,
     #[prost(message, optional, tag = "65")]
     pub read_state: Option<ReadStateUpdated>,
 }
