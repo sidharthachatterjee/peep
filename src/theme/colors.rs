@@ -18,6 +18,8 @@ pub struct Colors {
     pub border_control: Hsla,
     /// The ring around the control that has keyboard focus.
     pub focus_ring: Hsla,
+    /// Behind selected text.
+    pub selection: Hsla,
 
     pub text: Hsla,
     /// Secondary text: previews, timestamps, hints.
@@ -74,6 +76,7 @@ impl Colors {
             border: hex(0xe5e5e5),
             border_control: hex(0x8c8c8c),
             focus_ring: hex(0x2b7fff),
+            selection: hexa(0x2b7fff40),
 
             text: hex(0x0a0a0a),
             text_muted: hex(0x666666),
@@ -119,6 +122,7 @@ impl Colors {
             border: hexa(0xffffff1a),
             border_control: hex(0x707070),
             focus_ring: hex(0x2b7fff),
+            selection: hexa(0x2b7fff66),
 
             text: hex(0xfafafa),
             text_muted: hex(0xa1a1a1),

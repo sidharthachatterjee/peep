@@ -3721,6 +3721,7 @@ dependencies = [
  "sha1_smol",
  "thiserror 2.0.21",
  "tokio",
+ "unicode-segmentation",
 ]
 
 [[package]]

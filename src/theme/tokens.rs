@@ -71,6 +71,8 @@ pub struct Sizes {
     pub focus_ring: Pixels,
     /// Stroke of drawn glyphs such as the check mark.
     pub stroke: Pixels,
+    /// The line that marks where typing goes.
+    pub caret: Pixels,
     pub checkbox: Pixels,
     pub switch_width: Pixels,
     pub switch_height: Pixels,
@@ -180,6 +182,7 @@ impl Sizes {
             border: px(1.),
             focus_ring: px(2.),
             stroke: px(1.5),
+            caret: px(1.5),
             checkbox: px(16.),
             switch_width: px(32.),
             switch_height: px(18.),
