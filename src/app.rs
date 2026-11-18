@@ -3,6 +3,7 @@
 mod conversations;
 mod messages;
 
+use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
     App, Application, Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, Render,
     Window, actions, div, prelude::*,
@@ -11,6 +12,7 @@ use gpui::{
 use self::{conversations::Conversations, messages::Messages};
 use crate::{
     account::{Account, Status},
+    menu_bar::MenuBarItem,
     theme::ActiveTheme,
     ui::{self, Button, ButtonVariant, Color, Divider, Label, Root, TextSize},
 };
@@ -19,6 +21,11 @@ use crate::{
 struct SignedIn(Entity<Account>);
 
 impl Global for SignedIn {}
+
+/// Peep's icon in the menu bar, there for as long as Peep runs.
+struct InMenuBar(MenuBarItem);
+
+impl Global for InMenuBar {}
 
 actions!(peep, [Quit, Hide, Minimize, CloseWindow]);
 
@@ -34,10 +41,51 @@ pub fn run() {
     app.run(|cx| {
         init(cx);
         let account = cx.new(Account::new);
+        show_in_menu_bar(&account, cx);
         cx.set_global(SignedIn(account));
         open_window(cx);
         cx.activate(true);
     });
+}
+
+/// Puts Peep's icon in the menu bar, with the count of what is unread beside it. Clicking
+/// it brings Peep to the front.
+fn show_in_menu_bar(account: &Entity<Account>, cx: &mut App) {
+    let (clicks, mut clicked) = mpsc::unbounded();
+    let Some(item) = MenuBarItem::new(move || {
+        // Nothing listens once Peep is quitting.
+        clicks.unbounded_send(()).ok();
+    }) else {
+        return;
+    };
+    item.set_unread(account.read(cx).unread());
+    cx.set_global(InMenuBar(item));
+    cx.observe(account, |account, cx| {
+        let unread = account.read(cx).unread();
+        cx.global::<InMenuBar>().0.set_unread(unread);
+    })
+    .detach();
+    cx.spawn(async move |cx| {
+        while clicked.next().await.is_some() {
+            if cx.update(come_forward).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Brings Peep in front of other apps, with its window open.
+fn come_forward(cx: &mut App) {
+    cx.activate(true);
+    match cx.windows().first() {
+        Some(window) => {
+            if let Err(error) = window.update(cx, |_, window, _| window.activate_window()) {
+                eprintln!("Peep could not reach its window: {error:#}");
+            }
+        }
+        None => open_window(cx),
+    }
 }
 
 fn init(cx: &mut App) {

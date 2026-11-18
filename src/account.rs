@@ -92,6 +92,8 @@ pub struct TimelineChanged {
 pub struct Account {
     status: Status,
     rows: Vec<Row>,
+    /// How much is unread across everything, by Google Chat's own count.
+    unread: u32,
     /// The conversations and people behind the rows.
     directory: Directory,
     /// Messages loaded so far, by conversation.
@@ -146,6 +148,7 @@ impl Account {
             Status::Ready
         };
         let mut this = Self::with(status, rows);
+        this.unread = kept.directory.unread;
         this.directory = kept.directory.clone();
         this.kept = kept;
         this.live = true;
@@ -158,6 +161,7 @@ impl Account {
         Self {
             status,
             rows,
+            unread: 0,
             directory: Directory::default(),
             timelines: HashMap::new(),
             statuses: HashMap::new(),
@@ -203,6 +207,12 @@ impl Account {
 
     pub fn status(&self) -> &Status {
         &self.status
+    }
+
+    /// How much is unread across direct messages, spaces and followed threads, as Google
+    /// Chat itself counts it.
+    pub fn unread(&self) -> u32 {
+        self.unread
     }
 
     /// The direct messages, most recently active first.
@@ -596,6 +606,7 @@ impl Account {
         match result {
             Ok(snapshot) => {
                 self.rows = rows(&snapshot.directory, &self.statuses);
+                self.unread = snapshot.directory.unread;
                 self.directory = snapshot.directory.clone();
                 self.set_status(Status::Ready, cx);
                 // The same rows may now hold other people.
@@ -711,6 +722,12 @@ impl Account {
                 self.reported.insert(person);
                 self.statuses_changed(cx);
             }
+            Event::Unread(unread) => {
+                if self.unread != unread {
+                    self.unread = unread;
+                    cx.notify();
+                }
+            }
             Event::ListChanged => self.reload_soon(cx),
             Event::Other(_) => {}
         }
@@ -774,6 +791,7 @@ impl Account {
         self.connected = false;
         self.kept = Snapshot::default();
         self.rows.clear();
+        self.unread = 0;
         self.directory = Directory::default();
         self.timelines.clear();
         self.statuses.clear();
@@ -925,6 +943,7 @@ mod tests {
         };
         Directory {
             me: Some(UserId("me".into())),
+            unread: 0,
             conversations: vec![
                 conversation(ConversationId::Dm("a".into()), &["ada"], 3),
                 conversation(ConversationId::Space("s".into()), &["ada", "grace"], 2),
