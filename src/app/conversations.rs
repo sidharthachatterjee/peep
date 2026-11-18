@@ -51,6 +51,19 @@ impl Conversations {
         self.selected.clone()
     }
 
+    /// Selects the conversation with this id, if it is in the list.
+    pub fn select_id(&mut self, id: &str, cx: &mut Context<Self>) {
+        let index = self
+            .account
+            .read(cx)
+            .rows()
+            .iter()
+            .position(|row| row.id.as_ref() == id);
+        if let Some(index) = index {
+            self.select(index, cx);
+        }
+    }
+
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(id) = self
             .account

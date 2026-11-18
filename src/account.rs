@@ -16,7 +16,7 @@ use crate::{
     cache,
     chat::{
         self, Client, ConversationId, Directory, Event, Message, MessageKind, Page, Presence,
-        Snapshot, Status as PersonStatus, UserId,
+        Showing, Snapshot, Status as PersonStatus, UserId,
     },
     photos,
     session::{self, Session, SignIn},
@@ -94,6 +94,10 @@ pub struct Account {
     rows: Vec<Row>,
     /// How much is unread across everything, by Google Chat's own count.
     unread: u32,
+    /// What the signed-in person chose to show others.
+    showing: Showing,
+    /// Wakes when do not disturb ends by itself, to say so.
+    showing_task: Option<Task<()>>,
     /// The conversations and people behind the rows.
     directory: Directory,
     /// Messages loaded so far, by conversation.
@@ -149,6 +153,7 @@ impl Account {
         };
         let mut this = Self::with(status, rows);
         this.unread = kept.directory.unread;
+        this.set_showing(kept.directory.showing, cx);
         this.directory = kept.directory.clone();
         this.kept = kept;
         this.live = true;
@@ -162,6 +167,8 @@ impl Account {
             status,
             rows,
             unread: 0,
+            showing: Showing::Automatic,
+            showing_task: None,
             directory: Directory::default(),
             timelines: HashMap::new(),
             statuses: HashMap::new(),
@@ -213,6 +220,68 @@ impl Account {
     /// Chat itself counts it.
     pub fn unread(&self) -> u32 {
         self.unread
+    }
+
+    /// What the signed-in person is showing others right now.
+    pub fn showing(&self) -> Showing {
+        self.showing.at(now())
+    }
+
+    /// Changes what the signed-in person shows others, on every device.
+    pub fn show(&mut self, showing: Showing, cx: &mut Context<Self>) {
+        let Some(client) = &self.client else { return };
+        let saving = client.show(showing);
+        let before = self.showing;
+        // Shown at once; Google's answer follows.
+        self.set_showing(showing, cx);
+        cx.spawn(async move |this, cx| {
+            let saved = saving.await;
+            this.update(cx, |this, cx| match saved {
+                Ok(saved) => this.set_showing(saved, cx),
+                Err(chat::Error::SignedOut) => this.signed_out(cx),
+                Err(error) => {
+                    eprintln!("Peep could not change your status: {error}");
+                    this.set_showing(before, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_showing(&mut self, showing: Showing, cx: &mut Context<Self>) {
+        let showing = showing.at(now());
+        self.showing_task = match showing {
+            // Do not disturb ends by itself; whoever shows it is told when.
+            Showing::DoNotDisturb { until } => {
+                let left = Duration::from_micros(u64::try_from(until - now()).unwrap_or(0));
+                let timer = cx.background_executor().timer(left);
+                Some(cx.spawn(async move |this, cx| {
+                    timer.await;
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }))
+            }
+            _ => None,
+        };
+        if self.showing != showing {
+            self.showing = showing;
+            cx.notify();
+        }
+    }
+
+    /// Up to `most` conversations with something unread, most recently active first.
+    pub fn unread_rows(&self, most: usize) -> impl Iterator<Item = &Row> {
+        self.rows
+            .iter()
+            .filter(|row| row.unread.is_some())
+            .take(most)
+    }
+
+    /// Stops what only matters while Peep's window is open: watching the people on
+    /// screen and asking for their settings.
+    pub fn rest(&mut self, cx: &mut Context<Self>) {
+        self.show_rows(0..0, None, cx);
+        self.set_frontmost(false, cx);
     }
 
     /// The direct messages, most recently active first.
@@ -607,6 +676,7 @@ impl Account {
             Ok(snapshot) => {
                 self.rows = rows(&snapshot.directory, &self.statuses);
                 self.unread = snapshot.directory.unread;
+                self.set_showing(snapshot.directory.showing, cx);
                 self.directory = snapshot.directory.clone();
                 self.set_status(Status::Ready, cx);
                 // The same rows may now hold other people.
@@ -700,9 +770,13 @@ impl Account {
                 }
             }
             Event::Status {
+                person, showing, ..
+            } if self.directory.me.as_ref() == Some(&person) => self.set_showing(showing, cx),
+            Event::Status {
                 person,
                 quiet,
                 note,
+                ..
             } => {
                 // Only someone already asked about is shown, so only they are kept.
                 if let Some(status) = self.statuses.get_mut(&person) {
@@ -792,6 +866,7 @@ impl Account {
         self.kept = Snapshot::default();
         self.rows.clear();
         self.unread = 0;
+        self.set_showing(Showing::Automatic, cx);
         self.directory = Directory::default();
         self.timelines.clear();
         self.statuses.clear();
@@ -815,6 +890,11 @@ impl Account {
         self.status = status;
         cx.notify();
     }
+}
+
+/// Now, in microseconds since the Unix epoch.
+fn now() -> i64 {
+    (session::now() * 1_000_000.) as i64
 }
 
 /// Who a message is shown as being from.
@@ -943,6 +1023,7 @@ mod tests {
         };
         Directory {
             me: Some(UserId("me".into())),
+            showing: chat::Showing::Automatic,
             unread: 0,
             conversations: vec![
                 conversation(ConversationId::Dm("a".into()), &["ada"], 3),
@@ -1071,6 +1152,67 @@ mod tests {
     }
 
     #[gpui::test]
+    fn what_i_show_follows_other_devices_and_ends_by_itself(cx: &mut TestAppContext) {
+        let account = cx.new(|_| {
+            let mut account = Account::with(Status::Ready, Vec::new());
+            account.directory = directory();
+            account
+        });
+        let showing =
+            |cx: &mut TestAppContext| account.read_with(cx, |account, _| account.showing());
+        let hear = |person: &str, showing: Showing, cx: &mut TestAppContext| {
+            let event = Event::Status {
+                person: UserId(person.into()),
+                showing,
+                quiet: false,
+                note: "".into(),
+            };
+            account.update(cx, |account, cx| account.heard(event, cx));
+        };
+        assert_eq!(showing(cx), Showing::Automatic);
+
+        hear("ada", Showing::Away, cx);
+        assert_eq!(showing(cx), Showing::Automatic, "someone else's status");
+
+        hear("me", Showing::Away, cx);
+        assert_eq!(showing(cx), Showing::Away, "set on another device");
+
+        let later = Showing::DoNotDisturb {
+            until: now() + 60_000_000,
+        };
+        hear("me", later, cx);
+        assert_eq!(showing(cx), later);
+
+        hear("me", Showing::DoNotDisturb { until: now() - 1 }, cx);
+        assert_eq!(showing(cx), Showing::Automatic, "it has already ended");
+    }
+
+    #[test]
+    fn the_unread_rows_are_the_newest_few() {
+        let row = |id: &str, unread: bool| Row {
+            id: id.to_owned().into(),
+            unread: unread.then(|| "1".into()),
+            ..Default::default()
+        };
+        let rows = vec![
+            row("a", true),
+            row("b", false),
+            row("c", true),
+            row("d", true),
+        ];
+        let account = Account::with(Status::Ready, rows);
+
+        let ids = |most| {
+            account
+                .unread_rows(most)
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(2), ["a", "c"]);
+        assert_eq!(ids(5), ["a", "c", "d"]);
+    }
+
+    #[gpui::test]
     fn what_is_heard_about_a_person_changes_their_row(cx: &mut TestAppContext) {
         let account = cx.new(|_| {
             let mut account = Account::with(Status::Ready, Vec::new());
@@ -1110,6 +1252,7 @@ mod tests {
         hear(
             Event::Status {
                 person: UserId("ada".into()),
+                showing: chat::Showing::Automatic,
                 quiet: false,
                 note: "Back".into(),
             },

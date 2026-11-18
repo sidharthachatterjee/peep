@@ -92,6 +92,9 @@ pub struct UserStatus {
     pub user_id: Option<UserId>,
     #[prost(message, optional, tag = "2")]
     pub dnd_settings: Option<DndSettings>,
+    /// False when the person set themselves as away.
+    #[prost(bool, optional, tag = "5")]
+    pub presence_shared: Option<bool>,
     #[prost(message, optional, tag = "6")]
     pub custom_status: Option<CustomStatus>,
 }
@@ -101,6 +104,35 @@ pub struct DndSettings {
     /// 2 is do not disturb.
     #[prost(int32, tag = "1")]
     pub dnd_state: i32,
+    /// When do not disturb ends, or 0 when it is off.
+    #[prost(int64, tag = "2")]
+    pub dnd_expiry_time_usec: i64,
+}
+
+/// Turns do not disturb on for a while.
+#[derive(Clone, PartialEq, Message)]
+pub struct SetDndDurationRequest {
+    #[prost(int64, tag = "1")]
+    pub duration_usec: i64,
+    #[prost(bytes = "vec", tag = "100")]
+    pub request_header: Vec<u8>,
+}
+
+/// Shares whether the person is around, or shows them as away. Sharing also ends do not
+/// disturb.
+#[derive(Clone, PartialEq, Message)]
+pub struct SetPresenceSharedRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub presence_shared: Option<bool>,
+    #[prost(bytes = "vec", tag = "100")]
+    pub request_header: Vec<u8>,
+}
+
+/// The status as saved.
+#[derive(Clone, PartialEq, Message)]
+pub struct SetUserStatusResponse {
+    #[prost(message, optional, tag = "1")]
+    pub user_status: Option<UserStatus>,
 }
 
 /// What a person says they are doing, such as "In a meeting".

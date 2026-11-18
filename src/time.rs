@@ -85,6 +85,34 @@ impl Local {
     }
 }
 
+/// The hour a morning starts at, for "until tomorrow".
+const MORNING: libc::c_int = 8;
+
+/// Tomorrow morning on the wall clock, in microseconds since the Unix epoch.
+pub fn tomorrow_morning() -> i64 {
+    morning_after((crate::session::now() * 1_000_000.) as i64)
+}
+
+/// The morning of the day after `micros`.
+fn morning_after(micros: i64) -> i64 {
+    let seconds: libc::time_t = micros.div_euclid(1_000_000);
+    // SAFETY: `tm` is plain data that `localtime_r` fills in and `mktime` reads and tidies;
+    // both pointers are valid for the calls and nothing keeps them afterwards.
+    let morning = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&seconds, &mut tm);
+        // A day of the month past its end rolls over into the next month.
+        tm.tm_mday += 1;
+        tm.tm_hour = MORNING;
+        tm.tm_min = 0;
+        tm.tm_sec = 0;
+        // Whether daylight saving applies that morning is for the system to say.
+        tm.tm_isdst = -1;
+        libc::mktime(&mut tm)
+    };
+    morning * 1_000_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +153,23 @@ mod tests {
         assert_eq!(day(1970, 1, 1, 4).day_number(), 0);
         assert_eq!(day(2024, 2, 29, 4).day_number(), 19_782);
         assert_eq!(day(2024, 3, 1, 5).day_number(), 19_783);
+    }
+
+    #[test]
+    fn tomorrow_morning_is_at_eight_on_the_next_day() {
+        const HOUR: i64 = 60 * 60 * 1_000_000;
+        let noon = 1_700_049_600_000_000;
+
+        let morning = Local::at(morning_after(noon));
+        assert_eq!((morning.hour, morning.minute), (8, 0));
+        assert!(!morning.same_day(&Local::at(noon)));
+        let ahead = morning_after(noon) - noon;
+        assert!((0..48 * HOUR).contains(&ahead), "the very next morning");
+        assert_eq!(
+            morning_after(noon),
+            morning_after(noon + HOUR),
+            "the same morning from any time that day"
+        );
     }
 
     #[test]

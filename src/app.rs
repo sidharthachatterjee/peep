@@ -6,14 +6,17 @@ mod messages;
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
     App, Application, Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, Render,
-    Window, actions, div, prelude::*,
+    WeakEntity, Window, actions, div, prelude::*,
 };
 
 use self::{conversations::Conversations, messages::Messages};
 use crate::{
     account::{Account, Status},
-    menu_bar::MenuBarItem,
+    chat::Showing,
+    menu_bar::{Choice, Command, Content, MenuBarItem},
+    session,
     theme::ActiveTheme,
+    time,
     ui::{self, Button, ButtonVariant, Color, Divider, Label, Root, TextSize},
 };
 
@@ -26,6 +29,21 @@ impl Global for SignedIn {}
 struct InMenuBar(MenuBarItem);
 
 impl Global for InMenuBar {}
+
+/// Whether notifications are paused. Peep has none yet, so for now this only shows.
+#[derive(Default)]
+struct NotificationsPaused(bool);
+
+impl Global for NotificationsPaused {}
+
+/// The content of the open window, if there is one.
+#[derive(Default)]
+struct OpenWindow(Option<WeakEntity<Main>>);
+
+impl Global for OpenWindow {}
+
+/// How many unread conversations the menu bar's menu lists.
+const UNREAD_IN_MENU: usize = 5;
 
 actions!(peep, [Quit, Hide, Minimize, CloseWindow]);
 
@@ -41,38 +59,95 @@ pub fn run() {
     app.run(|cx| {
         init(cx);
         let account = cx.new(Account::new);
+        cx.set_global(SignedIn(account.clone()));
         show_in_menu_bar(&account, cx);
-        cx.set_global(SignedIn(account));
+        // With its window closed Peep stays in the menu bar, and does only what that needs.
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                let account = cx.global::<SignedIn>().0.clone();
+                account.update(cx, |account, cx| account.rest(cx));
+            }
+        })
+        .detach();
         open_window(cx);
         cx.activate(true);
     });
 }
 
-/// Puts Peep's icon in the menu bar, with the count of what is unread beside it. Clicking
-/// it brings Peep to the front.
+/// Puts Peep's icon in the menu bar, with the count of what is unread beside it and a menu
+/// behind it.
 fn show_in_menu_bar(account: &Entity<Account>, cx: &mut App) {
-    let (clicks, mut clicked) = mpsc::unbounded();
-    let Some(item) = MenuBarItem::new(move || {
+    let (commands, mut chosen) = mpsc::unbounded();
+    let Some(item) = MenuBarItem::new(move |command| {
         // Nothing listens once Peep is quitting.
-        clicks.unbounded_send(()).ok();
+        commands.unbounded_send(command).ok();
     }) else {
         return;
     };
-    item.set_unread(account.read(cx).unread());
     cx.set_global(InMenuBar(item));
-    cx.observe(account, |account, cx| {
-        let unread = account.read(cx).unread();
-        cx.global::<InMenuBar>().0.set_unread(unread);
-    })
-    .detach();
+    cx.set_global(NotificationsPaused::default());
+    update_menu_bar(cx);
+    cx.observe(account, |_, cx| update_menu_bar(cx)).detach();
+    cx.observe_global::<NotificationsPaused>(update_menu_bar)
+        .detach();
     cx.spawn(async move |cx| {
-        while clicked.next().await.is_some() {
-            if cx.update(come_forward).is_err() {
+        while let Some(command) = chosen.next().await {
+            if cx.update(|cx| carry_out(command, cx)).is_err() {
                 break;
             }
         }
     })
     .detach();
+}
+
+/// Shows the account as it is now in the menu bar.
+fn update_menu_bar(cx: &mut App) {
+    let account = cx.global::<SignedIn>().0.read(cx);
+    let content = Content {
+        showing: account.showing(),
+        paused: cx.global::<NotificationsPaused>().0,
+        unread: account.unread(),
+        conversations: account
+            .unread_rows(UNREAD_IN_MENU)
+            .map(|row| (row.id.to_string(), row.title.to_string()))
+            .collect(),
+    };
+    cx.global::<InMenuBar>().0.show(content);
+}
+
+/// Does what was chosen from the menu bar's menu.
+fn carry_out(command: Command, cx: &mut App) {
+    match command {
+        Command::Show(choice) => {
+            let now = (session::now() * 1_000_000.) as i64;
+            let showing = match choice {
+                Choice::Automatic => Showing::Automatic,
+                Choice::Away => Showing::Away,
+                Choice::DoNotDisturbFor(time) => Showing::DoNotDisturb {
+                    until: now + i64::try_from(time.as_micros()).unwrap_or(i64::MAX - now),
+                },
+                Choice::DoNotDisturbUntilTomorrow => Showing::DoNotDisturb {
+                    until: time::tomorrow_morning(),
+                },
+            };
+            let account = cx.global::<SignedIn>().0.clone();
+            account.update(cx, |account, cx| account.show(showing, cx));
+        }
+        Command::Pause(paused) => cx.set_global(NotificationsPaused(paused)),
+        Command::OpenConversation(id) => {
+            come_forward(cx);
+            let main = cx
+                .global::<OpenWindow>()
+                .0
+                .as_ref()
+                .and_then(WeakEntity::upgrade);
+            if let Some(main) = main {
+                let conversations = main.read(cx).conversations.clone();
+                conversations.update(cx, |conversations, cx| conversations.select_id(&id, cx));
+            }
+        }
+        Command::Quit => cx.quit(),
+    }
 }
 
 /// Brings Peep in front of other apps, with its window open.
@@ -124,6 +199,7 @@ fn open_window(cx: &mut App) {
     let account = cx.global::<SignedIn>().0.clone();
     let opened = cx.open_window(ui::window_options("Peep", cx), |window, cx| {
         let main = cx.new(|cx| Main::new(account, window, cx));
+        cx.set_global(OpenWindow(Some(main.downgrade())));
         cx.new(|cx| Root::new(main, window, cx))
     });
     if let Err(error) = opened {

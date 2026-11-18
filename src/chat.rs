@@ -42,6 +42,42 @@ pub enum Presence {
     DoNotDisturb,
 }
 
+/// What the signed-in person chose to show others. The three exclude each other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Showing {
+    /// Whether they are around, as it is.
+    #[default]
+    Automatic,
+    /// Not to be disturbed until `until`, in microseconds since the Unix epoch.
+    DoNotDisturb { until: i64 },
+    /// Away, whether or not they are around.
+    Away,
+}
+
+impl Showing {
+    /// What is in effect at `now`: do not disturb ends by itself.
+    pub fn at(self, now: i64) -> Self {
+        match self {
+            Showing::DoNotDisturb { until } if until <= now => Showing::Automatic,
+            showing => showing,
+        }
+    }
+
+    fn from_wire(status: &wire::UserStatus) -> Self {
+        let quiet = status
+            .dnd_settings
+            .as_ref()
+            .filter(|settings| settings.dnd_state == DO_NOT_DISTURB);
+        match quiet {
+            Some(settings) => Showing::DoNotDisturb {
+                until: settings.dnd_expiry_time_usec,
+            },
+            None if status.presence_shared == Some(false) => Showing::Away,
+            None => Showing::Automatic,
+        }
+    }
+}
+
 /// How a person is doing right now.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
@@ -117,6 +153,8 @@ pub struct Conversation {
 pub struct Directory {
     /// The signed-in person.
     pub me: Option<UserId>,
+    /// What they chose to show others.
+    pub showing: Showing,
     /// How much is unread across everything, by Google Chat's own count.
     pub unread: u32,
     /// Direct messages, most recently active first.
@@ -191,6 +229,8 @@ pub enum Event {
     /// A person changed their status settings. Whether they are around is not said.
     Status {
         person: UserId,
+        /// What they chose to show, which matters when they are the signed-in person.
+        showing: Showing,
         /// Whether they asked not to be disturbed.
         quiet: bool,
         /// What they say they are doing, or nothing.
@@ -438,9 +478,11 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
                 .and_then(|status| {
                     let person = status.user_id.clone().filter(|id| !id.id.is_empty())?;
                     let now = (crate::session::now() * 1_000_000.) as i64;
+                    let showing = Showing::from_wire(&status).at(now);
                     let (quiet, note) = settings(Some(status), now);
                     Some(Event::Status {
                         person: UserId(person.id.into()),
+                        showing,
                         quiet,
                         note,
                     })
@@ -1110,6 +1152,7 @@ mod tests {
         wire::UserStatus {
             user_id: Some(user_id("ada")),
             dnd_settings: None,
+            presence_shared: None,
             custom_status: Some(wire::CustomStatus {
                 status_text: text.into(),
                 state_expiry_timestamp_usec: expires,
@@ -1143,6 +1186,7 @@ mod tests {
         let mut quiet = custom("", "", 0);
         quiet.dnd_settings = Some(wire::DndSettings {
             dnd_state: DO_NOT_DISTURB,
+            dnd_expiry_time_usec: 0,
         });
         let quiet = read(presence(1, 0, Some(quiet)));
         assert_eq!(
@@ -1195,6 +1239,7 @@ mod tests {
         let mut settings = custom("Focusing", "", 0);
         settings.dnd_settings = Some(wire::DndSettings {
             dnd_state: DO_NOT_DISTURB,
+            dnd_expiry_time_usec: i64::MAX,
         });
         let report = wire::Event {
             bodies: vec![
@@ -1214,6 +1259,7 @@ mod tests {
             [
                 Event::Status {
                     person: UserId("ada".into()),
+                    showing: Showing::DoNotDisturb { until: i64::MAX },
                     quiet: true,
                     note: "Focusing".into(),
                 },
@@ -1254,5 +1300,34 @@ mod tests {
             ],
             "only the Home count is used"
         );
+    }
+
+    #[test]
+    fn what_someone_shows_is_automatic_do_not_disturb_or_away() {
+        let status = |dnd: Option<(i32, i64)>, shared: Option<bool>| wire::UserStatus {
+            dnd_settings: dnd.map(|(dnd_state, dnd_expiry_time_usec)| wire::DndSettings {
+                dnd_state,
+                dnd_expiry_time_usec,
+            }),
+            presence_shared: shared,
+            ..Default::default()
+        };
+        let showing = |status| Showing::from_wire(&status);
+
+        assert_eq!(showing(status(None, None)), Showing::Automatic);
+        assert_eq!(
+            showing(status(Some((1, 0)), Some(true))),
+            Showing::Automatic
+        );
+        assert_eq!(showing(status(None, Some(false))), Showing::Away);
+        assert_eq!(
+            showing(status(Some((DO_NOT_DISTURB, 500)), Some(false))),
+            Showing::DoNotDisturb { until: 500 }
+        );
+
+        let quiet = Showing::DoNotDisturb { until: 500 };
+        assert_eq!(quiet.at(499), quiet);
+        assert_eq!(quiet.at(500), Showing::Automatic, "it ends by itself");
+        assert_eq!(Showing::Away.at(i64::MAX), Showing::Away);
     }
 }

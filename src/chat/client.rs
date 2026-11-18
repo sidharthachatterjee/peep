@@ -13,8 +13,9 @@ use tokio::{
 };
 
 use super::{
-    Conversation, ConversationId, Directory, Event, Page, Snapshot, Status, Token, UNREAD_IN_HOME,
-    User, UserId, conversation, live::Registration, page, status, unread_in_home, wire,
+    Conversation, ConversationId, Directory, Event, Page, Showing, Snapshot, Status, Token,
+    UNREAD_IN_HOME, User, UserId, conversation, live::Registration, page, status, unread_in_home,
+    wire,
 };
 use crate::{
     network,
@@ -217,6 +218,34 @@ impl Client {
         })
     }
 
+    /// Changes what the signed-in person shows others, on every device. `DoNotDisturb`
+    /// lasts until its time, and the other two until changed. Gives what Google saved.
+    pub fn show(&self, showing: Showing) -> impl Future<Output = Result<Showing, Error>> + use<> {
+        self.spawn(move |inner| async move {
+            let now = (session::now() * 1_000_000.) as i64;
+            let saved: wire::SetUserStatusResponse = match showing {
+                Showing::DoNotDisturb { until } => {
+                    let request = wire::SetDndDurationRequest {
+                        duration_usec: (until - now).max(0),
+                        request_header: wire::request_header(),
+                    };
+                    inner.call("set_dnd_duration", &request).await?
+                }
+                Showing::Automatic | Showing::Away => {
+                    let request = wire::SetPresenceSharedRequest {
+                        presence_shared: Some(showing == Showing::Automatic),
+                        request_header: wire::request_header(),
+                    };
+                    inner.call("set_presence_shared", &request).await?
+                }
+            };
+            let saved = saved
+                .user_status
+                .ok_or(Error::Unreadable("the saved status"))?;
+            Ok(Showing::from_wire(&saved).at((session::now() * 1_000_000.) as i64))
+        })
+    }
+
     /// What happens from now on, as it happens. The channel behind it reconnects by itself
     /// and stops when the receiver is dropped.
     pub fn events(&self) -> UnboundedReceiver<Event> {
@@ -275,7 +304,8 @@ fn group_id(conversation: &ConversationId) -> wire::GroupId {
 
 impl Inner {
     async fn refresh(&self) -> Result<Snapshot, Error> {
-        let (me, items, unread) = futures::try_join!(self.me(), self.world(), self.unread())?;
+        let ((me, showing), items, unread) =
+            futures::try_join!(self.me(), self.world(), self.unread())?;
 
         let mut conversations: Vec<Conversation> = Vec::new();
         for item in items {
@@ -315,6 +345,7 @@ impl Inner {
 
         let mut directory = Directory {
             me: Some(me),
+            showing,
             unread,
             users: users.clone(),
             conversations,
@@ -326,17 +357,19 @@ impl Inner {
         })
     }
 
-    async fn me(&self) -> Result<UserId, Error> {
+    /// The signed-in person, and what they chose to show others.
+    async fn me(&self) -> Result<(UserId, Showing), Error> {
         const METHOD: &str = "get_self_user_status";
         let request = wire::GetSelfUserStatusRequest {
             request_header: wire::request_header(),
         };
         let response: wire::GetSelfUserStatusResponse = self.call(METHOD, &request).await?;
-        response
-            .user_status
-            .and_then(|status| status.user_id)
+        let status = response.user_status.ok_or(Error::Unreadable(METHOD))?;
+        let showing = Showing::from_wire(&status).at((session::now() * 1_000_000.) as i64);
+        status
+            .user_id
             .filter(|id| !id.id.is_empty())
-            .map(|id| UserId(id.id.into()))
+            .map(|id| (UserId(id.id.into()), showing))
             .ok_or(Error::Unreadable(METHOD))
     }
 
