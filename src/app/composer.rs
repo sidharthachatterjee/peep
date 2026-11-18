@@ -1,9 +1,9 @@
 //! Where a message is written: the box, who is typing back, and the list of people to name.
 
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, time::Duration};
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Subscription,
+    Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Subscription, Task,
     Window, div, prelude::*,
 };
 
@@ -23,14 +23,28 @@ const MOST_ROWS: usize = 8;
 const MOST_OFFERED: usize = 6;
 /// How far back from the caret an `@` is looked for.
 const LONGEST_NAME: usize = 40;
+/// How long typing a name must pause before the organisation is searched for it.
+const SEARCH_AFTER: Duration = Duration::from_millis(150);
 
 /// A name being typed after an `@`, and who it could be.
 #[derive(Clone, Debug, PartialEq)]
 struct Naming {
     /// The `@` and what follows it, up to the caret.
     range: Range<usize>,
-    people: Vec<Person>,
+    /// What follows the `@`.
+    typed: String,
+    /// The people in the conversation it could be, then others in the organisation, as
+    /// Google Chat offers them.
+    members: Vec<Person>,
+    others: Vec<Person>,
+    /// Which of them all is chosen, counting through the members first.
     chosen: usize,
+}
+
+impl Naming {
+    fn offered(&self) -> usize {
+        self.members.len() + self.others.len()
+    }
 }
 
 /// What is being written to one conversation.
@@ -47,9 +61,11 @@ pub struct Composer {
     input: Entity<TextInput>,
     /// What was left unsent in the other conversations.
     unsent: HashMap<SharedString, Writing>,
-    /// Who each `@Name` in the text is.
-    names: HashMap<String, UserId>,
+    /// Who each `@Name` in the text is, and whether they are in the conversation.
+    names: HashMap<String, (UserId, bool)>,
     naming: Option<Naming>,
+    /// Searches the organisation for the name being typed.
+    search: Task<()>,
     /// Why the last message could not be sent.
     error: Option<SharedString>,
     _subscriptions: [Subscription; 3],
@@ -76,6 +92,7 @@ impl Composer {
             unsent: HashMap::new(),
             names: HashMap::new(),
             naming: None,
+            search: Task::ready(()),
             error: None,
         }
     }
@@ -145,20 +162,58 @@ impl Composer {
 
         let naming = name_being_typed(&text, caret)
             .filter(|range| !named.iter().any(|named| named.contains(&range.start)))
-            .and_then(|range| {
-                let typed = &text[range.start + 1..range.end];
-                let people = matching(self.account.read(cx).people_in(&conversation), typed);
-                (!people.is_empty()).then(|| Naming {
-                    chosen: match &self.naming {
-                        Some(before) if before.people == people => before.chosen,
-                        _ => 0,
-                    },
+            .map(|range| {
+                let typed = text[range.start + 1..range.end].to_owned();
+                let before = self.naming.as_ref().filter(|before| before.typed == typed);
+                Naming {
+                    members: matching(self.account.read(cx).people_in(&conversation), &typed),
+                    // What the organisation was found to hold for this name still stands.
+                    others: before.map_or_else(Vec::new, |before| before.others.clone()),
+                    chosen: before.map_or(0, |before| before.chosen),
                     range,
-                    people,
-                })
+                    typed,
+                }
             });
+        let searched = self.naming.as_ref().map(|before| &before.typed);
+        if let Some(typed) = naming.as_ref().map(|naming| &naming.typed)
+            && searched != Some(typed)
+        {
+            self.search(typed.clone(), cx);
+        }
+        self.set_naming(naming, cx);
+    }
+
+    /// Searches the organisation for a name being typed, once typing pauses.
+    fn search(&mut self, typed: String, cx: &mut Context<Self>) {
+        self.search = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_AFTER).await;
+            let finding = this.update(cx, |this, cx| this.account.read(cx).find_people(&typed, cx));
+            let Ok(finding) = finding else { return };
+            let found = finding.await;
+            this.update(cx, |this, cx| {
+                let Some(mut naming) = this.naming.clone().filter(|naming| naming.typed == typed)
+                else {
+                    return;
+                };
+                let room = MOST_OFFERED.saturating_sub(naming.members.len());
+                naming.others = found
+                    .into_iter()
+                    .filter(|person| !naming.members.iter().any(|member| member.id == person.id))
+                    .take(room)
+                    .collect();
+                this.set_naming(Some(naming), cx);
+            })
+            .ok();
+        });
+    }
+
+    fn set_naming(&mut self, naming: Option<Naming>, cx: &mut Context<Self>) {
+        let naming = naming.map(|mut naming| {
+            naming.chosen = naming.chosen.min(naming.offered().saturating_sub(1));
+            naming
+        });
         if self.naming != naming {
-            let offering = naming.is_some();
+            let offering = naming.as_ref().is_some_and(|naming| naming.offered() > 0);
             self.naming = naming;
             self.input
                 .update(cx, |input, cx| input.set_choosing(offering, cx));
@@ -167,10 +222,8 @@ impl Composer {
     }
 
     fn stop_naming(&mut self, cx: &mut Context<Self>) {
-        if self.naming.take().is_some() {
-            self.input
-                .update(cx, |input, cx| input.set_choosing(false, cx));
-        }
+        self.search = Task::ready(());
+        self.set_naming(None, cx);
         cx.notify();
     }
 
@@ -179,7 +232,7 @@ impl Composer {
         let Some(naming) = &mut self.naming else {
             return;
         };
-        let (chosen, last) = (naming.chosen, naming.people.len() - 1);
+        let (chosen, last) = (naming.chosen, naming.offered().saturating_sub(1));
         match choice {
             Choice::Previous => naming.chosen = chosen.checked_sub(1).unwrap_or(last),
             Choice::Next => naming.chosen = if chosen == last { 0 } else { chosen + 1 },
@@ -194,11 +247,13 @@ impl Composer {
         let Some(naming) = self.naming.take() else {
             return;
         };
-        let Some(person) = naming.people.get(index) else {
+        let member = index < naming.members.len();
+        let Some(person) = naming.members.iter().chain(&naming.others).nth(index) else {
             return;
         };
         let name = format!("@{}", person.name);
-        self.names.insert(name.clone(), person.id.clone());
+        self.names.insert(name.clone(), (person.id.clone(), member));
+        self.search = Task::ready(());
         self.input.update(cx, |input, cx| {
             let start = naming.range.start;
             input.replace(naming.range, &format!("{name} "), cx);
@@ -225,9 +280,13 @@ impl Composer {
             .named
             .iter()
             .filter_map(|range| {
-                let person = self.names.get(&writing.text[range.clone()])?.clone();
+                let (person, member) = self.names.get(&writing.text[range.clone()])?.clone();
                 let range = range.start.checked_sub(start)?..range.end.checked_sub(start)?;
-                (range.end <= text.len()).then_some(Mention { person, range })
+                (range.end <= text.len()).then_some(Mention {
+                    person,
+                    range,
+                    member,
+                })
             })
             .collect();
         let draft = Draft {
@@ -342,8 +401,9 @@ impl Render for Composer {
         };
         let empty = self.input.read(cx).text().trim().is_empty();
 
-        let offered = self.naming.as_ref().map(|naming| {
-            let people = naming.people.iter().enumerate().map(|(index, person)| {
+        let offering = self.naming.as_ref().filter(|naming| naming.offered() > 0);
+        let offered = offering.map(|naming| {
+            let person = |index: usize, person: &Person| {
                 ListItem::new(("person", index))
                     .selected(index == naming.chosen)
                     .on_click(cx.listener(move |this, _, _, cx| this.name(index, cx)))
@@ -353,7 +413,18 @@ impl Render for Composer {
                             .photo(person.photo.clone()),
                     )
                     .child(Label::new(person.name.clone()).truncate())
-            });
+            };
+            let heading = |text: &'static str| {
+                div().px(theme.spacing.sm).py(theme.spacing.xs).child(
+                    Label::new(text)
+                        .size(TextSize::Caption)
+                        .color(Color::Muted)
+                        .emphasized(),
+                )
+            };
+            let members = naming.members.iter().enumerate();
+            let others = naming.others.iter().enumerate();
+            let first_other = naming.members.len();
             div()
                 .absolute()
                 .bottom_full()
@@ -366,7 +437,12 @@ impl Render for Composer {
                             .flex_col()
                             .min_w(theme.size.popover_min)
                             .p(theme.spacing.xs)
-                            .children(people),
+                            .children((first_other > 0).then(|| heading("In this conversation")))
+                            .children(members.map(|(index, member)| person(index, member)))
+                            .children((!naming.others.is_empty()).then(|| heading("People")))
+                            .children(
+                                others.map(|(index, other)| person(first_other + index, other)),
+                            ),
                     ),
                 )
         });

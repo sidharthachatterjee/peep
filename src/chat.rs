@@ -239,12 +239,15 @@ pub struct Draft {
     pub mentions: Vec<Mention>,
 }
 
-/// Someone named in a message, so that they are told about it.
+/// Someone named in a message.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mention {
     pub person: UserId,
     /// Where their name is in the text, `@` included, in bytes.
     pub range: std::ops::Range<usize>,
+    /// Whether they are in the conversation, and so are told about the message. Someone
+    /// who is not is only named: naming them never adds them to it.
+    pub member: bool,
 }
 
 /// An id for a message about to be sent, made the way Google Chat's own client makes them:
@@ -619,9 +622,11 @@ fn heard(body: wire::EventBody, group: Option<ConversationId>) -> Event {
 const DO_NOT_DISTURB: i32 = 2;
 /// Google's number for someone typing, as opposed to having stopped.
 const TYPING: i32 = 1;
-/// Google's numbers for an annotation that mentions someone, and for a plain mention.
+/// Google's numbers for an annotation that mentions someone, for a mention of someone in the
+/// conversation, and for one that only names someone who is not.
 const USER_MENTION: i32 = 6;
 const MENTION: i32 = 3;
+const REFERENCE: i32 = 6;
 
 /// How `mention` goes to Google: where the name is, counted in UTF-16 code units.
 fn mention(text: &str, mention: &Mention) -> wire::Annotation {
@@ -635,7 +640,10 @@ fn mention(text: &str, mention: &Mention) -> wire::Annotation {
         length: units(&text[mention.range.clone()]),
         user_mention: Some(wire::UserMention {
             id: Some(person.clone()),
-            kind: MENTION,
+            kind: match mention.member {
+                true => MENTION,
+                false => REFERENCE,
+            },
             invitee_info: Some(wire::InviteeInfo {
                 user_id: Some(person),
             }),
@@ -1687,8 +1695,18 @@ mod tests {
             &Mention {
                 person: UserId("ada".into()),
                 range: start..start + 4,
+                member: true,
             },
         );
+        let outsider = super::mention(
+            text,
+            &Mention {
+                person: UserId("ada".into()),
+                range: start..start + 4,
+                member: false,
+            },
+        );
+        assert_eq!(outsider.user_mention.unwrap().kind, 6, "named, not added");
 
         assert_eq!(
             (mention.kind, mention.start_index, mention.length),

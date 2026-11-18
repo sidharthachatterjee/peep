@@ -15,7 +15,7 @@ use tokio::{
 use super::{
     Conversation, ConversationId, Directory, Draft, Event, Page, Showing, Snapshot, Status, TYPING,
     Token, User, UserId, conversation,
-    live::{Registration, Subject},
+    live::{Registration, Subject, authorization},
     mention, message, page, status, wire,
 };
 use crate::{
@@ -27,6 +27,11 @@ pub(super) const ORIGIN: &str = "https://chat.google.com";
 const API_PATH: &str = "/api/";
 const BOOTSTRAP_PATH: &str = "/mole/world";
 const PROTOBUF: &str = "application/x-protobuf";
+/// Google's service for finding people in the organisation, as its web client asks it.
+const PEOPLE_HOST: &str = "people-pa.clients6.google.com";
+const PEOPLE_PATH: &str = "/$rpc/google.internal.people.v2.minimal.PeopleApiAutocompleteMinimalService/ListAutocompletions";
+/// The most people it is asked for.
+const MOST_PEOPLE: u32 = 40;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Conversations asked for per request: more than most accounts have, so one request
@@ -307,6 +312,21 @@ impl Client {
         })
     }
 
+    /// The people in the organisation whose name or address starts with `typed`, best first.
+    /// Nothing typed finds no one.
+    pub fn people(
+        &self,
+        typed: &str,
+    ) -> impl Future<Output = Result<Vec<(UserId, User)>, Error>> + use<> {
+        let typed = typed.to_owned();
+        self.spawn(move |inner| async move {
+            if typed.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            inner.people(&typed).await
+        })
+    }
+
     /// Says the signed-in person is typing in `conversation`. It wears off by itself.
     pub fn typing(
         &self,
@@ -510,6 +530,55 @@ impl Inner {
             .collect())
     }
 
+    async fn people(&self, typed: &str) -> Result<Vec<(UserId, User)>, Error> {
+        const WHAT: &str = "the people found";
+        // As the web client sends it. What the last two fields mean is not known.
+        let request = serde_json::json!([
+            typed,
+            null,
+            null,
+            ["DYNAMITE_WEB"],
+            MOST_PEOPLE,
+            null,
+            null,
+            [null, null, [null, 2]],
+            ["DYNAMITE_WEB", null, 2]
+        ]);
+        let mut fresh = false;
+        loop {
+            let key = self.registration(fresh).await?.key;
+            let now = session::now();
+            let mut asked = self
+                .http
+                .post(format!("https://{PEOPLE_HOST}{PEOPLE_PATH}"))
+                .header(
+                    header::COOKIE,
+                    self.session
+                        .cookie_header_for(PEOPLE_HOST, PEOPLE_PATH, now),
+                )
+                .header(header::CONTENT_TYPE, "application/json+protobuf")
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::REFERER, format!("{ORIGIN}/"))
+                .header("x-goog-api-key", key)
+                .header("x-user-agent", "grpc-web-javascript/0.1")
+                .body(request.to_string());
+            if let Some(secret) = self.session.api_secret(now) {
+                asked = asked
+                    .header(header::AUTHORIZATION, authorization(secret, now as u64))
+                    .header("X-Goog-AuthUser", "0");
+            }
+            let response = asked.send().await.map_err(network)?;
+            let status = response.status().as_u16();
+            let body = response.text().await.map_err(network)?;
+            match status {
+                200 => return people_found(&body).ok_or(Error::Unreadable(WHAT)),
+                // The key is read from a page that may have gone stale: read it once more.
+                401 | 403 if !fresh => fresh = true,
+                _ => return Err(refusal(status, None, &body)),
+            }
+        }
+    }
+
     async fn call<Request: Message, Response: Message + Default>(
         &self,
         method: &'static str,
@@ -636,6 +705,36 @@ impl Inner {
         *self.registration.lock().await = Registration::in_page(&page);
         Ok(fresh)
     }
+}
+
+/// The people in a reply from Google's people service. Each result is
+/// `[address, _, kind, person]`; a person carries their Google Chat id first, then their
+/// names and photos as lists of `[details, value]`.
+fn people_found(reply: &str) -> Option<Vec<(UserId, User)>> {
+    use serde_json::Value;
+
+    let reply = reply.strip_prefix(")]}'").unwrap_or(reply);
+    let reply: Value = serde_json::from_str(reply).ok()?;
+    // Nobody found comes back as nothing at all.
+    let results = reply.get(0).and_then(Value::as_array);
+    let first = |person: &Value, field: usize| {
+        let value = person.get(field)?.get(0)?.get(1)?.as_str()?;
+        Some(Arc::<str>::from(value))
+    };
+    let people = results.into_iter().flatten().filter_map(|result| {
+        if result.get(2)?.as_str()? != "PERSON" {
+            return None;
+        }
+        let person = result.get(3)?;
+        let id = person.get(0)?.as_str().filter(|id| !id.is_empty())?;
+        let user = User {
+            name: first(person, 2)?,
+            email: result.get(0).and_then(Value::as_str).unwrap_or("").into(),
+            photo: first(person, 3).unwrap_or_else(|| "".into()),
+        };
+        Some((UserId(id.into()), user))
+    });
+    Some(people.collect())
 }
 
 pub(super) fn network(error: reqwest::Error) -> Error {

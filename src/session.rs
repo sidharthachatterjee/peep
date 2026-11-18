@@ -110,10 +110,16 @@ impl Session {
 
     /// The `Cookie` header for a request to `https://chat.google.com{path}`.
     pub fn cookie_header(&self, path: &str, now: f64) -> String {
+        self.cookie_header_for(CHAT_HOST, path, now)
+    }
+
+    /// The `Cookie` header for a request to `https://{host}{path}`, for another of Google's
+    /// services the session reaches.
+    pub fn cookie_header_for(&self, host: &str, path: &str, now: f64) -> String {
         let mut cookies: Vec<&Cookie> = self
             .cookies
             .iter()
-            .filter(|cookie| cookie.applies(CHAT_HOST, path, now))
+            .filter(|cookie| cookie.applies(host, path, now))
             .collect();
         cookies.sort_by(|a, b| {
             b.path

@@ -123,3 +123,23 @@ fn the_live_channel_connects() {
     println!("connected: {connected} after {:?}", started.elapsed());
     assert!(connected);
 }
+
+#[test]
+#[ignore = "asks Google Chat"]
+fn people_in_the_organisation_are_found_by_the_start_of_a_name() {
+    let client = client();
+
+    let found = block_on(client.people("al")).expect("the people service answers");
+    println!("{} people found", found.len());
+    assert!(!found.is_empty());
+    assert!(
+        found
+            .iter()
+            .all(|(id, user)| !id.0.is_empty() && !user.name.is_empty())
+    );
+    assert!(
+        block_on(client.people(" "))
+            .expect("nothing is asked")
+            .is_empty()
+    );
+}

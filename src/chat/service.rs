@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use futures::{FutureExt as _, channel::mpsc::UnboundedReceiver, future::BoxFuture};
 
 use super::{
-    Client, ConversationId, Draft, Error, Event, Message, Page, Showing, Snapshot, Status, UserId,
+    Client, ConversationId, Draft, Error, Event, Message, Page, Showing, Snapshot, Status, User,
+    UserId,
 };
 
 /// What comes back from asking, once it has.
@@ -35,6 +36,9 @@ pub trait Service {
 
     /// Says the signed-in person is typing in `conversation`. It wears off by itself.
     fn typing(&self, conversation: &ConversationId) -> Answer<()>;
+
+    /// The people in the organisation whose name or address starts with `typed`, best first.
+    fn people(&self, typed: &str) -> Answer<Vec<(UserId, User)>>;
 
     /// What happens from now on, as it happens, until the receiver is dropped.
     fn events(&self) -> UnboundedReceiver<Event>;
@@ -71,6 +75,10 @@ impl Service for Client {
 
     fn typing(&self, conversation: &ConversationId) -> Answer<()> {
         Client::typing(self, conversation).boxed()
+    }
+
+    fn people(&self, typed: &str) -> Answer<Vec<(UserId, User)>> {
+        Client::people(self, typed).boxed()
     }
 
     fn events(&self) -> UnboundedReceiver<Event> {

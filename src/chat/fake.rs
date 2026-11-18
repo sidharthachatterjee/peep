@@ -28,6 +28,7 @@ pub(crate) enum Asked {
     Watch(Vec<String>, Vec<String>),
     Send(String, Draft),
     Typing(String),
+    People(String),
 }
 
 /// The service and the handle a test keeps on it are the same thing, shared.
@@ -40,6 +41,8 @@ struct State {
     /// Each conversation's messages by its key, oldest first.
     messages: HashMap<String, Vec<Message>>,
     statuses: HashMap<UserId, Status>,
+    /// Everyone in the organisation who is not in a conversation, by name.
+    colleagues: Vec<String>,
     /// Whether asking is refused, as when Google has signed the person out.
     signed_out: bool,
     /// Whether messages are refused.
@@ -134,6 +137,13 @@ impl Fake {
             known.muted = true;
         }
         drop(state);
+        self
+    }
+
+    /// Adds someone to the organisation who is in no conversation. Their id is their name
+    /// in lower case.
+    pub(crate) fn colleague(self, name: &str) -> Self {
+        self.0.borrow_mut().colleagues.push(name.to_owned());
         self
     }
 
@@ -343,6 +353,29 @@ impl Service for Fake {
 
     fn typing(&self, conversation: &ConversationId) -> Answer<()> {
         self.answer(Asked::Typing(conversation.key()), |_| ())
+    }
+
+    fn people(&self, typed: &str) -> Answer<Vec<(UserId, User)>> {
+        let typed = typed.to_lowercase();
+        self.answer(Asked::People(typed.clone()), |state| {
+            let known = state.directory.users.iter();
+            let known = known.map(|(id, user)| (id.clone(), user.clone()));
+            let others = state.colleagues.iter().map(|name| {
+                let id = name.to_lowercase();
+                let user = User {
+                    name: name.as_str().into(),
+                    email: format!("{id}@example.com").into(),
+                    photo: "".into(),
+                };
+                (UserId(id.into()), user)
+            });
+            let mut found: Vec<(UserId, User)> = known
+                .chain(others)
+                .filter(|(_, user)| user.name.to_lowercase().starts_with(&typed))
+                .collect();
+            found.sort_by(|one, other| one.1.name.cmp(&other.1.name));
+            found
+        })
     }
 
     fn watch(&self, people: Vec<UserId>, typing_in: Vec<ConversationId>) {

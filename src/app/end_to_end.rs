@@ -476,7 +476,8 @@ fn someone_named_with_an_at_is_mentioned(cx: &mut TestAppContext) {
                 text: "thanks @Ada !".into(),
                 mentions: vec![Mention {
                     person: UserId("ada".into()),
-                    range: 7..11
+                    range: 7..11,
+                    member: true,
                 }]
             }
         )]
@@ -667,4 +668,43 @@ fn reactions_show_as_they_change_and_my_messages_are_told_from_others(cx: &mut T
     });
     settle(cx);
     assert_eq!(shown(cx)[1].1, "", "the last one was taken back");
+}
+
+#[gpui::test]
+fn someone_outside_the_conversation_is_found_and_only_named(cx: &mut TestAppContext) {
+    let service = two_people().colleague("Linus").colleague("Lina");
+    let (_, cx) = start(&service, cx);
+    cx.simulate_keystrokes("tab down enter");
+    settle(cx);
+    service.asked();
+
+    cx.simulate_input("ask @li");
+    assert!(
+        !service.asked().contains(&Asked::People("li".into())),
+        "the organisation is not searched letter by letter"
+    );
+    settle(cx);
+    assert!(service.asked().contains(&Asked::People("li".into())));
+
+    // Nobody in the conversation is called Li-something: the first found is chosen.
+    cx.simulate_keystrokes("down enter");
+    assert_eq!(composer(cx).0, "ask @Linus ");
+    service.asked();
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+
+    assert_eq!(
+        service.asked().last(),
+        Some(&Asked::Send(
+            "dm/ada-dm".into(),
+            Draft {
+                text: "ask @Linus".into(),
+                mentions: vec![Mention {
+                    person: UserId("linus".into()),
+                    range: 4..10,
+                    member: false,
+                }]
+            }
+        ))
+    );
 }

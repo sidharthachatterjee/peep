@@ -59,7 +59,8 @@ pub(super) struct Registration {
     lease: Duration,
     /// Names the person's stream.
     target: String,
-    key: String,
+    /// The key Google's web client names itself with, to this service and others.
+    pub(super) key: String,
 }
 
 impl Registration {
@@ -701,7 +702,7 @@ impl Inner {
 
 /// The `Authorization` header Google's services take beside the cookies: a hash of the
 /// time, the session's API secret and the page the request comes from.
-fn authorization(secret: &str, seconds: u64) -> String {
+pub(super) fn authorization(secret: &str, seconds: u64) -> String {
     let hash = sha1_smol::Sha1::from(format!("{seconds} {secret} {ORIGIN}")).digest();
     format!("SAPISIDHASH {seconds}_{hash}")
 }

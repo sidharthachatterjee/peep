@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures::StreamExt as _;
-use gpui::{AppContext as _, Context, EventEmitter, SharedString, Task};
+use gpui::{App, AppContext as _, Context, EventEmitter, SharedString, Task};
 
 use self::timeline::Sender;
 pub use self::timeline::{Change, Entry, Timeline};
@@ -1053,6 +1053,27 @@ impl Account {
             })
             .filter(|person| !person.name.is_empty())
             .collect()
+    }
+
+    /// Finds people in the organisation whose name starts with `typed`, other than the
+    /// signed-in person. A search that fails finds no one.
+    pub fn find_people(&self, typed: &str, cx: &App) -> Task<Vec<Person>> {
+        let Some(client) = &self.client else {
+            return Task::ready(Vec::new());
+        };
+        let found = client.people(typed);
+        let me = self.directory.me.clone();
+        cx.background_spawn(async move {
+            let found = found.await.unwrap_or_default().into_iter();
+            found
+                .filter(|(id, user)| Some(id) != me.as_ref() && !user.name.is_empty())
+                .map(|(id, user)| Person {
+                    id,
+                    name: SharedString::from(user.name),
+                    photo: photo(&user.photo),
+                })
+                .collect()
+        })
     }
 
     /// Sends a message to a conversation. It shows there at once; if Google will not take
