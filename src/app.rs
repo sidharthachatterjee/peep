@@ -48,8 +48,13 @@ const UNREAD_IN_MENU: usize = 5;
 
 actions!(peep, [Quit, Hide, Minimize, CloseWindow]);
 
+/// Started with this, Peep opens no window and stays behind other apps: it is in the menu bar
+/// and the Dock until its window is asked for.
+const IN_BACKGROUND: &str = "--background";
+
 /// Runs Peep until the person quits it.
 pub fn run() {
+    let in_background = std::env::args().any(|argument| argument == IN_BACKGROUND);
     let app = gpui_platform::application();
     // Closing the window leaves Peep running; clicking its Dock icon brings the window back.
     app.on_reopen(|cx| {
@@ -57,7 +62,7 @@ pub fn run() {
             open_window(cx);
         }
     });
-    app.run(|cx| {
+    app.run(move |cx| {
         init(cx);
         let account = cx.new(Account::new);
         cx.set_global(SignedIn(account.clone()));
@@ -71,8 +76,10 @@ pub fn run() {
             }
         })
         .detach();
-        open_window(cx);
-        cx.activate(true);
+        if !in_background {
+            open_window(cx);
+            cx.activate(true);
+        }
     });
 }
 
