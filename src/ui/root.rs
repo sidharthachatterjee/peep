@@ -42,11 +42,13 @@ pub struct Root {
 impl Root {
     pub fn new(view: impl Into<AnyView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
         Self {
             view: view.into(),
             _subscriptions: [
-                cx.on_focus_lost(window, |this, window, _| window.focus(&this.focus_handle)),
+                cx.on_focus_lost(window, |this, window, cx| {
+                    window.focus(&this.focus_handle, cx)
+                }),
                 cx.observe_window_appearance(window, |_, _, cx| {
                     theme::system_appearance_changed(cx)
                 }),
@@ -81,11 +83,11 @@ impl Render for Root {
             .track_focus(&self.focus_handle)
             .on_action(|_: &FocusNext, window, cx| {
                 set_focus_visible(true, cx);
-                window.focus_next();
+                window.focus_next(cx);
             })
             .on_action(|_: &FocusPrevious, window, cx| {
                 set_focus_visible(true, cx);
-                window.focus_prev();
+                window.focus_prev(cx);
             })
             .on_any_mouse_down(|_, _, cx| set_focus_visible(false, cx))
             .size_full()

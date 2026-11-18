@@ -244,5 +244,6 @@ fn drop(offset_y: f32, blur: f32, spread: f32, color: u32) -> BoxShadow {
         offset: point(px(0.), px(offset_y)),
         blur_radius: px(blur),
         spread_radius: px(spread),
+        inset: false,
     }
 }

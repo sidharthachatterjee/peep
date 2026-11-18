@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use super::{
-    actions::Confirm,
+    actions::PRESSABLE,
     style::{ControlSize, Preview, focus, focus_ring, text_style},
 };
 use crate::theme::{ActiveTheme, Colors};
@@ -163,9 +163,7 @@ impl RenderOnce for Button {
                     .active(|style| style.bg(pressed))
                     // A click leaves keyboard focus where it was.
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    // Enter presses the focused button on key-up; keep it from also
-                    // confirming whatever contains the button.
-                    .on_action(|_: &Confirm, _, _| {})
+                    .key_context(PRESSABLE)
                     .when_some(self.on_click, |this, on_click| {
                         this.on_click(move |event, window, cx| on_click(event, window, cx))
                     })
@@ -183,7 +181,10 @@ mod tests {
     use gpui::TestAppContext;
 
     use super::*;
-    use crate::ui::test::{click, focus_is_on_root, open, press};
+    use crate::ui::{
+        actions::Confirm,
+        test::{click, focus_is_on_root, open, press},
+    };
 
     #[derive(Default)]
     struct Host {

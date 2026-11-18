@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use super::{
-    actions::Confirm,
+    actions::PRESSABLE,
     style::{Preview, focus, focus_ring, text_style},
 };
 use crate::theme::{ActiveTheme, Colors};
@@ -107,7 +107,7 @@ impl RenderOnce for Checkbox {
                 this.hover(|style| style.bg(hover))
                     .active(|style| style.bg(pressed))
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .on_action(|_: &Confirm, _, _| {})
+                    .key_context(PRESSABLE)
             })
             .when_some(toggle.clone(), |this, toggle| {
                 this.on_click(move |_, window, cx| toggle(window, cx))
@@ -236,7 +236,7 @@ impl RenderOnce for Switch {
                 this.hover(|style| style.bg(hover))
                     .active(|style| style.bg(pressed))
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .on_action(|_: &Confirm, _, _| {})
+                    .key_context(PRESSABLE)
                     .when_some(self.on_change, |this, on_change| {
                         this.on_click(move |_, window, cx| on_change(&!on, window, cx))
                     })

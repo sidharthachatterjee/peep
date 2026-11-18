@@ -33,7 +33,7 @@ pub(super) fn click(cx: &mut VisualTestContext, selector: &'static str) {
 }
 
 /// Presses and releases keys. `simulate_keystrokes` alone only presses them.
-pub(super) fn press(cx: &mut VisualTestContext, keys: &str) {
+pub(super) fn press(cx: &mut VisualTestContext, keys: &'static str) {
     for key in keys.split(' ') {
         cx.simulate_keystrokes(key);
         cx.simulate_event(KeyUpEvent {

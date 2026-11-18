@@ -1,4 +1,4 @@
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, KeyBinding, NoAction, actions};
 
 actions!(
     ui,
@@ -18,10 +18,15 @@ actions!(
     ]
 );
 
+/// The key context of a control that Enter presses, such as a button.
+pub(super) const PRESSABLE: &str = "Pressable";
+
 /// Binds the default keys. Bindings added later take precedence, so call this first.
 pub(super) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("enter", Confirm, None),
+        // Enter presses the focused control as it is released, and so confirms nothing else.
+        KeyBinding::new("enter", NoAction, Some(PRESSABLE)),
         KeyBinding::new("escape", Cancel, None),
         KeyBinding::new("down", Next, None),
         KeyBinding::new("up", Previous, None),

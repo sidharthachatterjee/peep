@@ -160,7 +160,7 @@ impl Render for Conversations {
                     .collect::<Vec<_>>()
             }),
         )
-        .track_scroll(self.scroll.clone())
+        .track_scroll(&self.scroll)
         .size_full();
 
         div()

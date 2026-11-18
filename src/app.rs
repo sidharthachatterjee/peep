@@ -5,8 +5,8 @@ mod messages;
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    App, Application, Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, Render,
-    WeakEntity, Window, actions, div, prelude::*,
+    App, Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, Render, WeakEntity,
+    Window, actions, div, prelude::*,
 };
 
 use self::{conversations::Conversations, messages::Messages};
@@ -49,7 +49,7 @@ actions!(peep, [Quit, Hide, Minimize, CloseWindow]);
 
 /// Runs Peep until the person quits it.
 pub fn run() {
-    let app = Application::new();
+    let app = gpui_platform::application();
     // Closing the window leaves Peep running; clicking its Dock icon brings the window back.
     app.on_reopen(|cx| {
         if cx.windows().is_empty() {
@@ -62,7 +62,7 @@ pub fn run() {
         cx.set_global(SignedIn(account.clone()));
         show_in_menu_bar(&account, cx);
         // With its window closed Peep stays in the menu bar, and does only what that needs.
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 let account = cx.global::<SignedIn>().0.clone();
                 account.update(cx, |account, cx| account.rest(cx));
@@ -92,9 +92,7 @@ fn show_in_menu_bar(account: &Entity<Account>, cx: &mut App) {
         .detach();
     cx.spawn(async move |cx| {
         while let Some(command) = chosen.next().await {
-            if cx.update(|cx| carry_out(command, cx)).is_err() {
-                break;
-            }
+            cx.update(|cx| carry_out(command, cx));
         }
     })
     .detach();
@@ -184,6 +182,7 @@ fn init(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Quit Peep", Quit),
             ],
+            disabled: false,
         },
         Menu {
             name: "Window".into(),
@@ -191,6 +190,7 @@ fn init(cx: &mut App) {
                 MenuItem::action("Minimize", Minimize),
                 MenuItem::action("Close Window", CloseWindow),
             ],
+            disabled: false,
         },
     ]);
 }

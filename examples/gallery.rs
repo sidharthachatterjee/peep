@@ -6,8 +6,8 @@
 //! ```
 
 use gpui::{
-    Animation, AnimationExt, App, Application, Context, Div, Hsla, IntoElement, Render,
-    SharedString, Window, div, prelude::*,
+    Animation, AnimationExt, App, Context, Div, Hsla, IntoElement, Render, SharedString, Window,
+    div, prelude::*,
 };
 use peep::{
     chat::Presence,
@@ -43,7 +43,7 @@ fn main() {
         _ => Mode::System,
     };
 
-    Application::new().run(move |cx| {
+    gpui_platform::application().run(move |cx| {
         ui::init(cx);
         theme::set_mode(mode, cx);
 
@@ -58,7 +58,7 @@ fn main() {
         if let Err(error) = opened {
             eprintln!("The gallery could not open its window: {error:#}");
         }
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
 }
