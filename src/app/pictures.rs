@@ -310,3 +310,14 @@ fn writing_a_message_that_names_someone() {
     drawn.type_text("for the warning about the ninth card, it did need punching again.");
     drawn.looks_like("named");
 }
+
+#[test]
+fn going_to_a_conversation_by_name() {
+    let mut drawn = Drawn::start(Mode::Light, Some(&people()));
+    drawn.open("dm/ada lovelace-dm");
+    drawn.press("cmd-k");
+    drawn.looks_like("switcher");
+
+    drawn.type_text("ma");
+    drawn.looks_like("switcher-typed");
+}

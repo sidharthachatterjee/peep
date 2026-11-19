@@ -95,6 +95,10 @@ pub struct Sizes {
     pub sidebar: Pixels,
     /// The narrowest a list that floats over the window is drawn.
     pub popover_min: Pixels,
+    /// The list that goes to a conversation by name: how wide it is, and how far below the
+    /// top of the window it sits.
+    pub switcher: Pixels,
+    pub switcher_top: Pixels,
     /// How much of a conversation's width a message's bubble may take.
     pub bubble_share: f32,
     /// How far past its edges a long list lays rows out, so scrolling never shows a gap.
@@ -203,6 +207,8 @@ impl Sizes {
             window_buttons: point(px(13.), px(12.)),
             sidebar: px(280.),
             popover_min: px(220.),
+            switcher: px(520.),
+            switcher_top: px(72.),
             bubble_share: 0.72,
             list_overdraw: px(600.),
             sign_in_window: size(px(480.), px(700.)),

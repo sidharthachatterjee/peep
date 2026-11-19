@@ -8,16 +8,18 @@ mod messages;
 mod notify;
 #[cfg(test)]
 mod pictures;
+mod switcher;
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    App, Context, Entity, Global, IntoElement, KeyBinding, Menu, MenuItem, Render, WeakEntity,
-    Window, actions, div, prelude::*,
+    App, Context, Entity, FocusHandle, Focusable as _, Global, IntoElement, KeyBinding, Menu,
+    MenuItem, MouseButton, Render, Subscription, WeakEntity, Window, actions, div, prelude::*,
 };
 
 use self::{
     conversations::{Conversations, Opened},
     messages::Messages,
+    switcher::{Switcher, SwitcherEvent},
 };
 use crate::{
     account::{Account, Status},
@@ -55,7 +57,17 @@ impl Global for OpenWindow {}
 /// How many unread conversations the menu bar's menu lists.
 const UNREAD_IN_MENU: usize = 5;
 
-actions!(peep, [Quit, Hide, Minimize, CloseWindow]);
+actions!(
+    peep,
+    [
+        Quit,
+        Hide,
+        Minimize,
+        CloseWindow,
+        /// Go to a conversation by typing some of its name.
+        GoToConversation
+    ]
+);
 
 /// Started with this, Peep opens no window and stays behind other apps: it is in the menu bar
 /// and the Dock until its window is asked for.
@@ -223,11 +235,17 @@ fn init(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
+    cx.on_action(|_: &GoToConversation, cx| {
+        // Chosen from the menu with the window closed, it opens the window first.
+        come_forward(cx);
+        in_main(cx, |main, window, cx| main.toggle_switcher(window, cx));
+    });
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-k", GoToConversation, None),
     ]);
     cx.set_menus(vec![
         Menu {
@@ -237,6 +255,11 @@ fn init(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Quit Peep", Quit),
             ],
+            disabled: false,
+        },
+        Menu {
+            name: "Go".into(),
+            items: vec![MenuItem::action("Go to Conversation…", GoToConversation)],
             disabled: false,
         },
         Menu {
@@ -276,6 +299,36 @@ fn with_active_window(cx: &mut App, action: impl FnOnce(&mut Window) + 'static) 
     });
 }
 
+/// Does something with the content of the open window, once the current event has been
+/// handled.
+fn in_main(
+    cx: &mut App,
+    change: impl FnOnce(&mut Main, &mut Window, &mut Context<Main>) + 'static,
+) {
+    cx.defer(move |cx| {
+        let main = cx.global::<OpenWindow>().0.as_ref();
+        let Some(main) = main.and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        let Some(window) = cx.windows().first().copied() else {
+            return;
+        };
+        window
+            .update(cx, |_, window, cx| {
+                main.update(cx, |main, cx| change(main, window, cx))
+            })
+            .ok();
+    });
+}
+
+/// The list that goes to a conversation by name, while it is open.
+struct OpenSwitcher {
+    switcher: Entity<Switcher>,
+    /// Where keyboard focus was before it opened, to go back to.
+    focus_before: Option<FocusHandle>,
+    _subscriptions: [Subscription; 2],
+}
+
 /// The content of the main window.
 struct Main {
     account: Entity<Account>,
@@ -283,6 +336,7 @@ struct Main {
     messages: Entity<Messages>,
     /// Whether the window is the one the person is typing in, in front of other apps.
     in_front: bool,
+    switcher: Option<OpenSwitcher>,
 }
 
 impl Main {
@@ -319,7 +373,59 @@ impl Main {
             conversations,
             messages,
             in_front: active,
+            switcher: None,
         }
+    }
+
+    /// Opens the list that goes to a conversation by name, or puts it away.
+    fn toggle_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_some() {
+            return self.close_switcher(true, window, cx);
+        }
+        if *self.account.read(cx).status() != Status::Ready {
+            return;
+        }
+        let switcher = cx.new(|cx| Switcher::new(self.account.clone(), cx));
+        let focus = switcher.focus_handle(cx);
+        let focus_before = window.focused(cx);
+        window.focus(&focus, cx);
+        self.switcher = Some(OpenSwitcher {
+            _subscriptions: [
+                cx.subscribe_in(
+                    &switcher,
+                    window,
+                    |this, _, event, window, cx| match event {
+                        SwitcherEvent::Picked(id) => {
+                            this.close_switcher(false, window, cx);
+                            this.conversations
+                                .update(cx, |conversations, cx| conversations.select_id(id, cx));
+                            // It was gone to to be read and answered.
+                            this.messages
+                                .update(cx, |messages, cx| messages.write(window, cx));
+                        }
+                        SwitcherEvent::Dismissed => this.close_switcher(true, window, cx),
+                    },
+                ),
+                // Focus leaving it, by Shift-Tab or a click, puts it away.
+                cx.on_blur(&focus, window, |this, window, cx| {
+                    this.close_switcher(false, window, cx);
+                }),
+            ],
+            switcher,
+            focus_before,
+        });
+        cx.notify();
+    }
+
+    /// Puts the switcher away. `restore` puts keyboard focus back where it was.
+    fn close_switcher(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.switcher.take() else {
+            return;
+        };
+        if let Some(focus) = open.focus_before.filter(|_| restore) {
+            window.focus(&focus, cx);
+        }
+        cx.notify();
     }
 }
 
@@ -337,7 +443,7 @@ impl Render for Main {
         };
         let note = |text: &'static str| Label::new(text).color(Color::Muted);
 
-        match self.account.read(cx).status() {
+        let content = match self.account.read(cx).status() {
             Status::Starting => centered(),
             Status::Loading => centered().child(note("Loading your messages…")),
             Status::SigningIn => {
@@ -374,7 +480,32 @@ impl Render for Main {
                         .h_full()
                         .child(self.messages.clone()),
                 ),
-        }
+        };
+
+        // Over everything else, so a click beside it puts it away and reaches nothing.
+        let switcher = self.switcher.as_ref().map(|open| {
+            div()
+                .absolute()
+                .size_full()
+                .top_0()
+                .left_0()
+                .occlude()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(theme.size.switcher_top)
+                .px(theme.spacing.lg)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_switcher(true, window, cx)),
+                )
+                .child(open.switcher.clone())
+        });
+        div()
+            .relative()
+            .size_full()
+            .child(content)
+            .children(switcher)
     }
 }
 

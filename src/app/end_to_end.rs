@@ -772,3 +772,106 @@ fn someone_already_known_is_offered_without_waiting_for_google(cx: &mut TestAppC
         "who stays offered as more is typed"
     );
 }
+
+/// What the list that goes to a conversation by name shows, if it is open.
+fn switcher(cx: &mut VisualTestContext) -> Option<Vec<String>> {
+    cx.update(|_, cx| {
+        let open = main(cx).read(cx).switcher.as_ref()?.switcher.clone();
+        Some(open.update(cx, |switcher, cx| switcher.listed(cx)))
+    })
+}
+
+/// The name of the selected conversation.
+fn selected(account: &Entity<Account>, cx: &mut VisualTestContext) -> Option<String> {
+    let id = cx.update(|_, cx| main(cx).read(cx).conversations.read(cx).selected_id())?;
+    account.read_with(cx, |account, _| {
+        let row = account.rows().iter().find(|row| row.id == id)?;
+        Some(row.title.to_string())
+    })
+}
+
+#[gpui::test]
+fn cmd_k_lists_what_is_unread_and_goes_to_a_conversation_by_name(cx: &mut TestAppContext) {
+    let service = two_people()
+        .conversation("Alan", &[("alan", "Hello")], 30, 1)
+        .conversation("Margaret", &[("margaret", "Hello")], 20, 0);
+    let (account, cx) = start(&service, cx);
+    assert_eq!(switcher(cx), None);
+
+    cx.simulate_keystrokes("cmd-k");
+    assert_eq!(
+        switcher(cx).unwrap(),
+        ["[Unread]", "> Ada", "Margaret", "[Recent]", "Grace", "Alan"],
+        "nothing typed: what is unread, then what was last active"
+    );
+
+    cx.simulate_keystrokes("down down down down");
+    assert_eq!(
+        switcher(cx).unwrap()[1],
+        "> Ada",
+        "Down goes round to the top"
+    );
+    cx.simulate_keystrokes("up");
+    assert_eq!(
+        switcher(cx).unwrap()[5],
+        "> Alan",
+        "and Up round to the bottom"
+    );
+    cx.simulate_keystrokes("up up enter");
+    settle(cx);
+    assert_eq!(
+        switcher(cx),
+        None,
+        "Enter goes there and puts the list away"
+    );
+    assert_eq!(selected(&account, cx).as_deref(), Some("Margaret"));
+    cx.simulate_input("Hi");
+    assert_eq!(composer(cx).0, "Hi", "ready to write in");
+
+    cx.simulate_keystrokes("cmd-k");
+    cx.simulate_input("a");
+    assert_eq!(
+        switcher(cx).unwrap(),
+        ["> Ada", "Alan", "Grace", "Margaret"]
+    );
+    cx.simulate_input("l");
+    assert_eq!(switcher(cx).unwrap(), ["> Alan"]);
+    cx.simulate_input("x");
+    assert_eq!(switcher(cx).unwrap(), [] as [&str; 0]);
+    cx.simulate_keystrokes("enter backspace enter");
+    settle(cx);
+    assert_eq!(selected(&account, cx).as_deref(), Some("Alan"));
+}
+
+#[gpui::test]
+fn escape_or_cmd_k_again_puts_the_list_away_and_focus_back(cx: &mut TestAppContext) {
+    let service = two_people();
+    let (account, cx) = start(&service, cx);
+    // Focus is on the conversation list, with Ada selected.
+    cx.simulate_keystrokes("tab down");
+    settle(cx);
+
+    cx.simulate_keystrokes("cmd-k");
+    cx.simulate_input("gr");
+    cx.simulate_keystrokes("escape");
+    assert_eq!(switcher(cx), None);
+    assert_eq!(
+        selected(&account, cx).as_deref(),
+        Some("Ada"),
+        "nothing was gone to"
+    );
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        selected(&account, cx).as_deref(),
+        Some("Grace"),
+        "the keyboard is back in the conversation list"
+    );
+
+    cx.simulate_keystrokes("cmd-k");
+    assert!(switcher(cx).is_some());
+    cx.simulate_keystrokes("cmd-k");
+    assert_eq!(switcher(cx), None);
+
+    cx.simulate_keystrokes("cmd-k shift-tab");
+    assert_eq!(switcher(cx), None, "focus leaving it puts it away");
+}
