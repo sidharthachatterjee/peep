@@ -51,6 +51,10 @@ const PEOPLE_PER_REQUEST: usize = 100;
 /// same time by leaving people out: asked about 500 at once, it reported a fifth of those
 /// who were active.
 const STATUSES_PER_REQUEST: usize = 50;
+/// Google's numbers for the two kinds of conversation: between two people or with an app,
+/// and spaces, which group conversations are.
+const BETWEEN_TWO: i32 = 1;
+const SPACES: i32 = 2;
 /// A guard against a server that never stops paging.
 const MAX_PAGES: usize = 50;
 /// How long a request token is used before a fresh one is fetched, in seconds. Google
@@ -95,11 +99,8 @@ pub(super) struct Inner {
     pub(super) watched: std::sync::Mutex<Vec<Subject>>,
     /// Tells the live channel that `watched` changed.
     pub(super) watched_changed: Notify,
-    /// Everyone who has been looked up. What an earlier launch kept is looked up once
-    /// more, since names and photos change; after that no one is looked up twice.
+    /// Everyone who has been looked up, starting with those an earlier launch kept.
     users: Mutex<HashMap<UserId, User>>,
-    /// Whether what an earlier launch kept has been looked up again.
-    users_current: Mutex<bool>,
 }
 
 impl Client {
@@ -128,7 +129,6 @@ impl Client {
             watched: std::sync::Mutex::new(Vec::new()),
             watched_changed: Notify::new(),
             users: Mutex::new(snapshot.directory.users),
-            users_current: Mutex::new(false),
         })))
     }
 
@@ -136,6 +136,19 @@ impl Client {
     /// next launch.
     pub fn refresh(&self) -> impl Future<Output = Result<Snapshot, Error>> + use<> {
         self.spawn(move |inner| async move { inner.refresh().await })
+    }
+
+    /// Looks everyone known up again, since names and photos change. Says whether any did:
+    /// [`refresh`](Self::refresh) then gives them. Once a launch is enough.
+    pub fn renew_people(&self) -> impl Future<Output = Result<bool, Error>> + use<> {
+        self.spawn(move |inner| async move {
+            let known: Vec<UserId> = inner.users.lock().await.keys().cloned().collect();
+            let found = inner.users(&known.iter().collect::<Vec<_>>()).await?;
+            let mut users = inner.users.lock().await;
+            let changed = found.iter().any(|(id, user)| users.get(id) != Some(user));
+            users.extend(found);
+            Ok(changed)
+        })
     }
 
     /// A page of a conversation's messages: the newest, or those before `before`, which is
@@ -382,7 +395,10 @@ fn group_id(conversation: &ConversationId) -> wire::GroupId {
 
 impl Inner {
     async fn refresh(&self) -> Result<Snapshot, Error> {
-        let ((me, showing), items) = futures::try_join!(self.me(), self.world())?;
+        // Asked for side by side: Google takes longer over one long list than two shorter.
+        let ((me, showing), between_two, spaces) =
+            futures::try_join!(self.me(), self.world(BETWEEN_TWO), self.world(SPACES))?;
+        let items = between_two.into_iter().chain(spaces);
 
         let mut conversations: Vec<Conversation> = Vec::new();
         for item in items {
@@ -406,14 +422,12 @@ impl Inner {
         members.dedup();
 
         let mut users = self.users.lock().await;
-        let mut current = self.users_current.lock().await;
         let unknown: Vec<&UserId> = members
             .iter()
             .copied()
-            .filter(|id| !*current || !users.contains_key(id))
+            .filter(|id| !users.contains_key(id))
             .collect();
         users.extend(self.users(&unknown).await?);
-        *current = true;
         users.retain(|id, _| {
             members
                 .binary_search_by(|member| member.0.cmp(&id.0))
@@ -449,8 +463,8 @@ impl Inner {
             .ok_or(Error::Unreadable(METHOD))
     }
 
-    /// Every conversation in the sidebar, spaces included.
-    async fn world(&self) -> Result<Vec<wire::WorldItem>, Error> {
+    /// Every conversation of one kind in the sidebar.
+    async fn world(&self, kind: i32) -> Result<Vec<wire::WorldItem>, Error> {
         let mut items = Vec::new();
         let mut page = String::new();
         for _ in 0..MAX_PAGES {
@@ -458,6 +472,7 @@ impl Inner {
                 request_header: wire::request_header(),
                 world_section_requests: vec![wire::WorldSectionRequest {
                     page_size: PAGE_SIZE,
+                    world_filter: Some(wire::WorldFilter { group_type: kind }),
                     pagination_token: page.clone(),
                 }],
                 fetch_from_user_spaces: true,

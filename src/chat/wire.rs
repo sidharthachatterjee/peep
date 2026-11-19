@@ -193,8 +193,19 @@ pub struct PaginatedWorldRequest {
 pub struct WorldSectionRequest {
     #[prost(int32, tag = "1")]
     pub page_size: i32,
+    #[prost(message, optional, tag = "4")]
+    pub world_filter: Option<WorldFilter>,
     #[prost(string, tag = "6")]
     pub pagination_token: String,
+}
+
+/// Which conversations a section lists.
+#[derive(Clone, PartialEq, Message)]
+pub struct WorldFilter {
+    /// 1 is conversations between two people and with apps, 2 is spaces, which group
+    /// conversations are.
+    #[prost(int32, tag = "6")]
+    pub group_type: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]

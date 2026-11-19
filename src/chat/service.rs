@@ -17,6 +17,10 @@ pub trait Service {
     /// The direct messages and the people in them, with what to keep for the next launch.
     fn refresh(&self) -> Answer<Snapshot>;
 
+    /// Looks everyone known up again, since names and photos change. Says whether any did:
+    /// `refresh` then gives them.
+    fn renew_people(&self) -> Answer<bool>;
+
     /// A page of a conversation's messages: the newest, or those before `before`, which is
     /// the `older` of the page after it.
     fn messages(&self, conversation: &ConversationId, before: Option<i64>) -> Answer<Page>;
@@ -51,6 +55,10 @@ pub trait Service {
 impl Service for Client {
     fn refresh(&self) -> Answer<Snapshot> {
         Client::refresh(self).boxed()
+    }
+
+    fn renew_people(&self) -> Answer<bool> {
+        Client::renew_people(self).boxed()
     }
 
     fn messages(&self, conversation: &ConversationId, before: Option<i64>) -> Answer<Page> {

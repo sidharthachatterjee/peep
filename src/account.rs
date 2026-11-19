@@ -178,6 +178,8 @@ pub struct Account {
     connected: bool,
     /// When the list was last asked for.
     asked: Option<Instant>,
+    /// Whether everyone has been looked up again since Peep started.
+    people_renewed: bool,
     sign_in_task: Option<Task<()>>,
     load_task: Option<Task<()>>,
     /// Reads the live channel for as long as the client is in use.
@@ -238,6 +240,7 @@ impl Account {
             client: None,
             connected: false,
             asked: None,
+            people_renewed: false,
             sign_in_task: None,
             load_task: None,
             live_task: None,
@@ -749,6 +752,23 @@ impl Account {
         }));
     }
 
+    /// Once a launch, after the list shows: looks everyone up again, and loads the list
+    /// once more if a name or photo changed. The list shows first with what was kept.
+    fn renew_people(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.as_ref().filter(|_| !self.people_renewed) else {
+            return;
+        };
+        self.people_renewed = true;
+        let renewed = client.renew_people();
+        cx.spawn(async move |this, cx| {
+            // If this fails, people keep the names they had.
+            if renewed.await == Ok(true) {
+                this.update(cx, |this, cx| this.load(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
     fn loaded(&mut self, result: Result<Snapshot, chat::Error>, cx: &mut Context<Self>) {
         match result {
             Ok(snapshot) => {
@@ -758,6 +778,7 @@ impl Account {
                 self.set_status(Status::Ready, cx);
                 // The same rows may now hold other people.
                 self.watch_soon(cx);
+                self.renew_people(cx);
                 let recent: Vec<SharedString> = self
                     .rows
                     .iter()
@@ -1147,6 +1168,7 @@ impl Account {
         self.client = None;
         self.live_task = None;
         self.connected = false;
+        self.people_renewed = false;
         self.kept = Snapshot::default();
         self.rows.clear();
         self.set_showing(Showing::Automatic, cx);

@@ -45,9 +45,15 @@ pub fn stored() -> Result<Option<Session>, Error> {
     if !profile.exists() {
         return Ok(None);
     }
-    let mut chrome = Chrome::launch(&profile, &["--headless=new", "about:blank"])?;
+    // Chrome is only asked for its cookies, so it opens no page.
+    let mut chrome = Chrome::launch(&profile, &["--headless=new", "--no-startup-window"])?;
     let session = chrome.session();
-    chrome.close();
+    match &session {
+        // Nothing waits for Chrome to finish quitting.
+        Ok(Some(_)) => drop(std::thread::spawn(move || chrome.close())),
+        // A sign-in may follow, which needs the profile to itself.
+        _ => chrome.close(),
+    }
     session
 }
 

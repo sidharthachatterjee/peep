@@ -708,3 +708,32 @@ fn someone_outside_the_conversation_is_found_and_only_named(cx: &mut TestAppCont
         ))
     );
 }
+
+#[gpui::test]
+fn the_list_shows_with_the_names_kept_and_then_with_any_that_changed(cx: &mut TestAppContext) {
+    let service = two_people().renamed("ada", "Ada King");
+    let (account, cx) = start(&service, cx);
+
+    let asked = service.asked();
+    let refreshes = asked
+        .iter()
+        .filter(|asked| **asked == Asked::Refresh)
+        .count();
+    assert_eq!(
+        asked.iter().position(|asked| *asked == Asked::RenewPeople),
+        asked
+            .iter()
+            .position(|asked| *asked == Asked::Refresh)
+            .map(|first| first + 1),
+        "people are looked up again only after the list has loaded: {asked:?}"
+    );
+    assert_eq!(refreshes, 2, "a changed name loads the list once more");
+    assert_eq!(list(&account, cx)[0].0, "Ada King");
+
+    service.say(Event::ListChanged);
+    settle(cx);
+    assert!(
+        !service.asked().contains(&Asked::RenewPeople),
+        "once a launch"
+    );
+}

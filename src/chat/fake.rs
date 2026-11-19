@@ -20,6 +20,7 @@ const PAGE: usize = 3;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Asked {
     Refresh,
+    RenewPeople,
     Messages(String, Option<i64>),
     MarkRead(String, i64),
     Statuses(Vec<String>),
@@ -47,6 +48,8 @@ struct State {
     signed_out: bool,
     /// Whether messages are refused.
     refusing_messages: bool,
+    /// A person's new name, found when everyone is looked up again.
+    renamed: Option<(UserId, String)>,
     listeners: Vec<UnboundedSender<Event>>,
     asked: Vec<Asked>,
     /// When the newest things happen, if not now.
@@ -211,6 +214,12 @@ impl Fake {
         self.0.borrow_mut().signed_out = true;
     }
 
+    /// Gives a person another name, which shows once everyone is looked up again.
+    pub(crate) fn renamed(self, person: &str, name: &str) -> Self {
+        self.0.borrow_mut().renamed = Some((UserId(person.into()), name.to_owned()));
+        self
+    }
+
     /// From now on messages are not taken.
     pub(crate) fn refuse_messages(&self) {
         self.0.borrow_mut().refusing_messages = true;
@@ -248,6 +257,22 @@ impl Service for Fake {
         self.answer(Asked::Refresh, |state| Snapshot {
             directory: state.directory.clone(),
             token: None,
+        })
+    }
+
+    fn renew_people(&self) -> Answer<bool> {
+        self.answer(Asked::RenewPeople, |state| {
+            let Some((person, name)) = state.renamed.take() else {
+                return false;
+            };
+            if let Some(user) = state.directory.users.get_mut(&person) {
+                user.name = name.as_str().into();
+            }
+            let known = state.directory.conversations.iter_mut();
+            for conversation in known.filter(|known| known.members == [person.clone()]) {
+                conversation.title = name.as_str().into();
+            }
+            true
         })
     }
 
