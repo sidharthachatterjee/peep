@@ -1076,6 +1076,21 @@ impl Account {
             .collect()
     }
 
+    /// Everyone the signed-in person has a conversation with, who can be named without
+    /// asking Google who they are.
+    pub fn people_known(&self) -> Vec<Person> {
+        let me = self.directory.me.as_ref();
+        let known = self.directory.users.iter();
+        known
+            .filter(|(id, user)| Some(*id) != me && !user.name.is_empty())
+            .map(|(id, user)| Person {
+                id: id.clone(),
+                name: SharedString::from(user.name.clone()),
+                photo: photo(&user.photo),
+            })
+            .collect()
+    }
+
     /// Finds people in the organisation whose name starts with `typed`, other than the
     /// signed-in person. A search that fails finds no one.
     pub fn find_people(&self, typed: &str, cx: &App) -> Task<Vec<Person>> {

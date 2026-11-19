@@ -64,8 +64,11 @@ pub struct Composer {
     /// Who each `@Name` in the text is, and whether they are in the conversation.
     names: HashMap<String, (UserId, bool)>,
     naming: Option<Naming>,
-    /// Searches the organisation for the name being typed.
+    /// Asks Google for the name being typed, and the name it was last asked for.
     search: Task<()>,
+    searched: Option<String>,
+    /// Everyone Google has found, kept so they are offered at once the next time.
+    found: HashMap<UserId, Person>,
     /// Why the last message could not be sent.
     error: Option<SharedString>,
     _subscriptions: [Subscription; 3],
@@ -93,6 +96,8 @@ impl Composer {
             names: HashMap::new(),
             naming: None,
             search: Task::ready(()),
+            searched: None,
+            found: HashMap::new(),
             error: None,
         }
     }
@@ -127,6 +132,14 @@ impl Composer {
         (self.input.read(cx).text().to_owned(), error)
     }
 
+    /// The names of the people offered for the name being typed.
+    #[cfg(test)]
+    pub(super) fn offered(&self) -> Vec<String> {
+        let naming = self.naming.iter();
+        let people = naming.flat_map(|naming| naming.members.iter().chain(&naming.others));
+        people.map(|person| person.name.to_string()).collect()
+    }
+
     fn writing(&self, cx: &Context<Self>) -> Writing {
         let input = self.input.read(cx);
         Writing {
@@ -149,41 +162,71 @@ impl Composer {
         let Some(conversation) = self.conversation.clone() else {
             return;
         };
-        let (text, caret, named) = {
-            let input = self.input.read(cx);
-            let caret = input.caret();
-            (input.text().to_owned(), caret, input.accented().to_vec())
-        };
-        if !text.is_empty() {
+        if !self.input.read(cx).text().is_empty() {
             self.error = None;
             self.account
                 .update(cx, |account, cx| account.typing(&conversation, cx));
         }
 
-        let naming = name_being_typed(&text, caret)
-            .filter(|range| !named.iter().any(|named| named.contains(&range.start)))
-            .map(|range| {
-                let typed = text[range.start + 1..range.end].to_owned();
-                let before = self.naming.as_ref().filter(|before| before.typed == typed);
-                Naming {
-                    members: matching(self.account.read(cx).people_in(&conversation), &typed),
-                    // What the organisation was found to hold for this name still stands.
-                    others: before.map_or_else(Vec::new, |before| before.others.clone()),
-                    chosen: before.map_or(0, |before| before.chosen),
-                    range,
-                    typed,
-                }
-            });
-        let searched = self.naming.as_ref().map(|before| &before.typed);
-        if let Some(typed) = naming.as_ref().map(|naming| &naming.typed)
-            && searched != Some(typed)
-        {
-            self.search(typed.clone(), cx);
-        }
-        self.set_naming(naming, cx);
+        self.offer(cx);
     }
 
-    /// Searches the organisation for a name being typed, once typing pauses.
+    /// Offers people for the name being typed, if one is. Those in the conversation and
+    /// those already known are offered at once; Google is asked for more while there is
+    /// room for them.
+    fn offer(&mut self, cx: &mut Context<Self>) {
+        let Some(conversation) = self.conversation.clone() else {
+            return;
+        };
+        let input = self.input.read(cx);
+        let (text, caret) = (input.text(), input.caret());
+        let named = input.accented();
+        let range = name_being_typed(text, caret)
+            .filter(|range| !named.iter().any(|named| named.contains(&range.start)));
+        let Some(range) = range else {
+            return self.stop_naming(cx);
+        };
+        let typed = text[range.start + 1..range.end].to_owned();
+
+        let account = self.account.read(cx);
+        let members = matching(account.people_in(&conversation), &typed);
+        let room = MOST_OFFERED.saturating_sub(members.len());
+        // Before a letter is typed there is no telling who else is meant.
+        let others = match typed.is_empty() {
+            true => Vec::new(),
+            false => {
+                let mut others = account.people_known();
+                others.extend(self.found.values().cloned());
+                others.sort_by(|one, other| one.id.0.cmp(&other.id.0));
+                others.dedup_by(|one, other| one.id == other.id);
+                others.retain(|person| !members.iter().any(|member| member.id == person.id));
+                let mut others = matching(others, &typed);
+                others.truncate(room);
+                others
+            }
+        };
+        let full = members.len() + others.len() >= MOST_OFFERED;
+        let chosen = match &self.naming {
+            Some(before) if before.typed == typed => before.chosen,
+            _ => 0,
+        };
+        if self.searched.as_ref() != Some(&typed) && !full {
+            self.searched = Some(typed.clone());
+            self.search(typed.clone(), cx);
+        }
+        self.set_naming(
+            Some(Naming {
+                range,
+                typed,
+                members,
+                others,
+                chosen,
+            }),
+            cx,
+        );
+    }
+
+    /// Asks Google who in the organisation has the name being typed, once typing pauses.
     fn search(&mut self, typed: String, cx: &mut Context<Self>) {
         self.search = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_AFTER).await;
@@ -191,17 +234,12 @@ impl Composer {
             let Ok(finding) = finding else { return };
             let found = finding.await;
             this.update(cx, |this, cx| {
-                let Some(mut naming) = this.naming.clone().filter(|naming| naming.typed == typed)
-                else {
-                    return;
-                };
-                let room = MOST_OFFERED.saturating_sub(naming.members.len());
-                naming.others = found
-                    .into_iter()
-                    .filter(|person| !naming.members.iter().any(|member| member.id == person.id))
-                    .take(room)
-                    .collect();
-                this.set_naming(Some(naming), cx);
+                let found = found.into_iter().map(|person| (person.id.clone(), person));
+                this.found.extend(found);
+                // Whoever was found is offered if their name still fits what is typed now.
+                if this.naming.is_some() {
+                    this.offer(cx);
+                }
             })
             .ok();
         });
@@ -223,8 +261,8 @@ impl Composer {
 
     fn stop_naming(&mut self, cx: &mut Context<Self>) {
         self.search = Task::ready(());
+        self.searched = None;
         self.set_naming(None, cx);
-        cx.notify();
     }
 
     /// A key pressed while people are offered.
@@ -254,6 +292,7 @@ impl Composer {
         let name = format!("@{}", person.name);
         self.names.insert(name.clone(), (person.id.clone(), member));
         self.search = Task::ready(());
+        self.searched = None;
         self.input.update(cx, |input, cx| {
             let start = naming.range.start;
             input.replace(naming.range, &format!("{name} "), cx);

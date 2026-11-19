@@ -326,18 +326,14 @@ impl Client {
     }
 
     /// The people in the organisation whose name or address starts with `typed`, best first.
-    /// Nothing typed finds no one.
+    /// Nothing typed finds no one, but is still asked: the first question of a launch takes
+    /// a second longer than the rest, and this gets it over with.
     pub fn people(
         &self,
         typed: &str,
     ) -> impl Future<Output = Result<Vec<(UserId, User)>, Error>> + use<> {
-        let typed = typed.to_owned();
-        self.spawn(move |inner| async move {
-            if typed.trim().is_empty() {
-                return Ok(Vec::new());
-            }
-            inner.people(&typed).await
-        })
+        let typed = typed.trim().to_owned();
+        self.spawn(move |inner| async move { inner.people(&typed).await })
     }
 
     /// Says the signed-in person is typing in `conversation`. It wears off by itself.

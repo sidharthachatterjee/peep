@@ -737,3 +737,38 @@ fn the_list_shows_with_the_names_kept_and_then_with_any_that_changed(cx: &mut Te
         "once a launch"
     );
 }
+
+#[gpui::test]
+fn someone_already_known_is_offered_without_waiting_for_google(cx: &mut TestAppContext) {
+    let service = two_people().colleague("Gregor");
+    let (_, cx) = start(&service, cx);
+    cx.simulate_keystrokes("tab down enter");
+    settle(cx);
+    service.asked();
+    let offered = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let messages = main(cx).read(cx).messages.clone();
+            let composer = messages.read(cx).composer().clone();
+            composer.read(cx).offered()
+        })
+    };
+
+    cx.simulate_input("@");
+    assert_eq!(offered(cx), ["Ada"], "before a letter, only who is here");
+    cx.simulate_input("g");
+    assert_eq!(offered(cx), ["Grace"], "known from another conversation");
+    assert_eq!(service.asked(), [Asked::Typing("dm/ada-dm".into())]);
+
+    settle(cx);
+    assert_eq!(
+        offered(cx),
+        ["Grace", "Gregor"],
+        "then whoever Google finds"
+    );
+    cx.simulate_input("r");
+    assert_eq!(
+        offered(cx),
+        ["Grace", "Gregor"],
+        "who stays offered as more is typed"
+    );
+}
